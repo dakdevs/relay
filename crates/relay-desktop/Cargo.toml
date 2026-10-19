@@ -41,6 +41,9 @@ harness = false
 # Shaders compile at launch, so builds need no separately downloaded Metal Toolchain.
 gpui_platform = { workspace = true, features = ["runtime_shaders"] }
 tray-icon = { version = "0.26.1", default-features = false }
+# Already built by GPUI; used only to make the popover panel borderless.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSResponder", "NSView", "NSWindow"] }
+raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }

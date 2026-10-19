@@ -173,6 +173,8 @@ fn toggle_popover(anchor: Option<gpui::Point<Pixels>>, item_height: f32, cx: &mu
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {
+        #[cfg(target_os = "macos")]
+        make_borderless(window);
         let view = cx.new(|cx| Popover::new(store, window, cx));
         window
             .subscribe(
@@ -202,6 +204,41 @@ fn toggle_popover(anchor: Option<gpui::Point<Pixels>>, item_height: f32, cx: &mu
         }
         Err(error) => eprintln!("relay: could not open the popover: {error}"),
     }
+}
+
+/// GPUI's macOS backend gives title-less windows `NSTitledWindowMask`
+/// anyway, so AppKit frames the whole transparent window, shadow margin
+/// included: a hairline outline, clipped corners and a window shadow around
+/// an empty strip. Dropping the title bit and the native shadow leaves only
+/// the panel and the shadow it draws itself.
+#[cfg(target_os = "macos")]
+fn make_borderless(window: &Window) {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: GPUI's AppKit handle is its live content NSView, and
+    // `open_window` builds the root view on the main thread.
+    #[allow(unsafe_code)]
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let Some(native) = view.window() else {
+        return;
+    };
+    native.setStyleMask(borderless(native.styleMask()));
+    native.setHasShadow(false);
+}
+
+/// Removes only the title bit: the non-activating panel bit keeps the
+/// popover from activating on click. GPUI's panel class still answers
+/// `canBecomeKeyWindow` with YES, so keyboard input keeps working.
+#[cfg(target_os = "macos")]
+fn borderless(mask: objc2_app_kit::NSWindowStyleMask) -> objc2_app_kit::NSWindowStyleMask {
+    mask.difference(objc2_app_kit::NSWindowStyleMask::Titled)
 }
 
 fn open_main_deferred(tab: Tab, window: &mut Window, cx: &mut App) {
@@ -296,4 +333,25 @@ pub fn keep_times_fresh<T: 'static>(
             });
         }
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use objc2_app_kit::NSWindowStyleMask as Mask;
+
+    #[test]
+    fn popover_mask_is_borderless_and_still_a_non_activating_panel() {
+        // The mask GPUI's pinned macOS backend builds for a
+        // `titlebar: None`, `WindowKind::PopUp` window.
+        let gpui = Mask::Titled | Mask::FullSizeContentView | Mask::NonactivatingPanel;
+        let mask = super::borderless(gpui);
+        assert!(
+            !mask.contains(Mask::Titled),
+            "AppKit draws a frame for titled windows"
+        );
+        assert!(mask.contains(Mask::NonactivatingPanel));
+        // Keeps GPUI's frame maths (`get_frame`) on the full-size-content path.
+        assert!(mask.contains(Mask::FullSizeContentView));
+        assert!(!mask.intersects(Mask::Closable | Mask::Resizable | Mask::Miniaturizable));
+    }
 }

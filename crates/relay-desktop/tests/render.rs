@@ -294,6 +294,20 @@ fn assert_inset_clear(img: &image::RgbaImage, scale: f32, t: &Theme) {
     }
 }
 
+/// Nothing may be painted in the shadow margin's outer corners: no fill,
+/// frame or outline around the panel. Headless captures composite onto
+/// opaque black, so "clear" reads as black here, not as zero alpha.
+fn assert_outer_corners_clear(img: &image::RgbaImage, what: &str) {
+    let (r, b) = (img.width() - 1, img.height() - 1);
+    for (x, y) in [(0, 0), (r, 0), (0, b), (r, b)] {
+        let p = img.get_pixel(x, y).0;
+        assert!(
+            p[..3].iter().all(|&c| c <= 2),
+            "{what}: outer corner ({x},{y}) is painted: {p:?}"
+        );
+    }
+}
+
 fn not_blank(img: &image::RgbaImage, what: &str) {
     let first = img.get_pixel(img.width() / 2, img.height() / 2).0;
     let distinct = img.pixels().filter(|p| p.0 != first).count();
@@ -464,6 +478,7 @@ fn main() {
             };
             let scale = img.width() as f32 / (360. + SHADOW_MARGIN * 2.);
             not_blank(&img, name);
+            assert_outer_corners_clear(&img, name);
             // Header area just inside the panel: popover surface colour.
             assert_pixel_near(
                 &img,
