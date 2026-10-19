@@ -25,13 +25,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        # 22.04 has the oldest (strictest) desktop-file-validate we support.
+        os: [ubuntu-22.04, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install shellcheck
         if: runner.os == 'macOS'
         run: brew install shellcheck
+      - name: Install shellcheck and desktop-file-utils
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends shellcheck desktop-file-utils
       - name: Version
         run: scripts/version.sh check
       - name: Script tests

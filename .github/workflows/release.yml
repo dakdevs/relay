@@ -21,7 +21,8 @@ env:
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
+    # 22.04 has the oldest (strictest) desktop-file-validate we support.
+    runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -38,6 +39,8 @@ jobs:
             version="$(scripts/version.sh check)"
           fi
           echo "version=$version" >>"$GITHUB_OUTPUT"
+      - name: Install shellcheck and desktop-file-utils
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends shellcheck desktop-file-utils
       - name: Release tooling tests
         run: scripts/test.sh
 

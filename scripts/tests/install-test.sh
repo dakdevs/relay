@@ -124,6 +124,9 @@ for sh in "${installer_shells[@]}"; do
   check "$tag installed binary reports version" test "$("$home/.local/bin/relay" --version)" == "relay $version"
   check "$tag desktop entry uses absolute Exec" grep -qx "Exec=$home/.local/bin/relay" "$home/.local/share/applications/dev.dak.relay.desktop"
   check "$tag desktop entry keeps Icon" grep -qx "Icon=dev.dak.relay" "$home/.local/share/applications/dev.dak.relay.desktop"
+  if command -v desktop-file-validate >/dev/null; then
+    check "$tag installed desktop entry validates" desktop-file-validate "$home/.local/share/applications/dev.dak.relay.desktop"
+  fi
   check "$tag icon installed" test -f "$home/.local/share/icons/hicolor/256x256/apps/dev.dak.relay.png"
   check "$tag no staging leftovers" test -z "$(find "$home" -name '*.relay-install.*' -print -quit)"
 

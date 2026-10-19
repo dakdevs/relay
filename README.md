@@ -9,11 +9,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/design-preview-tray-light.png" width="380" alt="Design preview: tray popover, light">
-  <img src="docs/images/design-preview-tray-dark.png" width="380" alt="Design preview: tray popover, dark">
+  <img src="docs/images/render-tray-light.png" width="300" alt="Relay tray popover, light theme, native GPUI render with sample data">
+  <img src="docs/images/render-tray-dark.png" width="300" alt="Relay tray popover, dark theme, native GPUI render with sample data">
 </p>
 
-<p align="center"><sub><b>Design preview.</b> Approved Paper designs with sample data, not screenshots of the running app.</sub></p>
+<p align="center"><sub><b>Native GPUI render with sample data.</b> Rendered offscreen from Relay's own views; no live accounts. <a href="https://app.paper.design/file/01M58Z151ZVWZ4VVK921R3Q5J9/p-2-0">Approved design</a></sub></p>
 
 > [!NOTE]
 > Relay is early. The repository is private and no release has been published yet, so the public one-line installer below doesn't work yet. Installing needs the GitHub CLI logged in to an account with access to `dakdevs/relay`.
@@ -29,9 +29,9 @@ Relay runs a local proxy on `127.0.0.1` that speaks the two APIs the stock CLIs 
 - **Contained.** Relay forwards only to an allow-list of provider origins. Configuration names where a credential lives (environment variable, file or keychain) instead of storing it, and secrets are never logged.
 
 <p align="center">
-  <img src="docs/images/design-preview-quotas.png" width="760" alt="Design preview: main window, Quotas ledger">
+  <img src="docs/images/render-quotas-light.png" width="760" alt="Relay main window, Quotas ledger, native GPUI render with sample data">
 </p>
-<p align="center"><sub><b>Design preview</b> of the main window's Quotas ledger, with sample data.</sub></p>
+<p align="center"><sub><b>Native GPUI render with sample data</b> of the main window's Quotas ledger (cropped); no live accounts.</sub></p>
 
 ## Install
 
