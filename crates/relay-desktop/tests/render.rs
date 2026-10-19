@@ -9,7 +9,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use gpui::{AppContext, HeadlessAppContext, Pixels, Size, px, size};
+use gpui::{AppContext, EntityInputHandler, Focusable, HeadlessAppContext, Pixels, Size, px, size};
 use relay_core::{
     config::PeriodKind,
     model::{AccountId, AccountMode, CredentialKind, Provider},
@@ -18,12 +18,13 @@ use relay_core::{
     snapshot::{AccountState, AccountView, Capabilities, RoutingStatus, Snapshot, group_accounts},
 };
 use relay_desktop::{
+    accounts::{Choice, ConnectFlow, ConnectSheet, SHEET_MAX_WIDTH},
     adapter,
     assets::Assets,
     dashboard::Dashboard,
     model::Through,
     popover::{Popover, SHADOW_MARGIN},
-    store::{Store, Tab},
+    store::{ConnectEvent, Setup, Store, Tab},
     theme::Theme,
     widgets::Ui,
 };
@@ -518,6 +519,8 @@ fn main() {
             });
             let _ = cx.update_window(handle.into(), |_, window, _| window.remove_window());
         }
+
+        connect_sheets(&mut cx, &theme, suffix, &mut results);
     }
     for r in &results {
         println!("rendered {} ({}×{})", r.name, r.width, r.height);
@@ -603,4 +606,490 @@ fn usage_fixture() -> Vec<relay_desktop::model::UsageRow> {
             2,
         ),
     ]
+}
+
+// ---------------------------------------------------------------- connect sheet
+
+const LONG_LABEL: &str = "Personal research workstation for the evaluation team, second floor";
+const LONG_ID: &str =
+    "dakota.washbrook-longname+relay-evaluation@extremely-long-subdomain.example.com";
+const LONG_CODEX_PATH: &str = "/Users/someone/Library/Application Support/codex-homes/personal-research-workstation/auth.json";
+const LONG_CLAUDE_PATH: &str = "/Users/someone/Library/Application Support/claude-configs/personal-research-workstation/.credentials.json";
+const LONG_ERROR: &str = "Couldn't save the account: the configuration file /Users/someone/Library/Application Support/Relay/config.toml is read-only (permission denied).";
+
+struct SheetCase {
+    name: &'static str,
+    window: (f32, f32),
+    provider: Provider,
+    choice: Choice,
+    flow: ConnectFlow,
+    fields: [&'static str; 3],
+    /// Content must be taller than the space above the footer.
+    expect_scroll: bool,
+}
+
+fn sheet_cases() -> Vec<SheetCase> {
+    let step_two = |op, reconnect: bool| {
+        if reconnect {
+            ConnectFlow::reconnecting("openai-dev".into(), op, None)
+        } else {
+            let mut f = ConnectFlow::fresh();
+            f.submitted(op);
+            f.on_event(&ConnectEvent::Saved {
+                op,
+                id: "openai-dev".into(),
+            });
+            f
+        }
+    };
+    let failed = |message: &str| {
+        let mut f = ConnectFlow::fresh();
+        f.send_failed(message.into());
+        f
+    };
+    vec![
+        SheetCase {
+            name: "sheet-anthropic-observe",
+            window: (1100., 860.),
+            provider: Provider::Anthropic,
+            choice: Choice::Observe,
+            flow: ConnectFlow::fresh(),
+            fields: ["", "", ""],
+            expect_scroll: false,
+        },
+        SheetCase {
+            name: "sheet-openai-pool-long",
+            window: (1100., 860.),
+            provider: Provider::Openai,
+            choice: Choice::Pool,
+            flow: failed(LONG_ERROR),
+            fields: [LONG_LABEL, LONG_ID, LONG_CODEX_PATH],
+            expect_scroll: false,
+        },
+        SheetCase {
+            name: "sheet-openai-observe",
+            window: (1100., 860.),
+            provider: Provider::Openai,
+            choice: Choice::Observe,
+            flow: ConnectFlow::fresh(),
+            fields: ["Dev", "dev@acme.co", ""],
+            expect_scroll: false,
+        },
+        SheetCase {
+            name: "sheet-openai-key",
+            window: (1100., 860.),
+            provider: Provider::Openai,
+            choice: Choice::Key,
+            flow: ConnectFlow::fresh(),
+            fields: ["Key A", "", ""],
+            expect_scroll: false,
+        },
+        SheetCase {
+            name: "sheet-anthropic-pool-long",
+            window: (1100., 860.),
+            provider: Provider::Anthropic,
+            choice: Choice::Pool,
+            flow: ConnectFlow::fresh(),
+            fields: [LONG_LABEL, LONG_ID, LONG_CLAUDE_PATH],
+            expect_scroll: false,
+        },
+        SheetCase {
+            name: "sheet-anthropic-key-narrow",
+            window: (420., 560.),
+            provider: Provider::Anthropic,
+            choice: Choice::Key,
+            flow: failed(LONG_ERROR),
+            fields: [
+                LONG_LABEL,
+                LONG_ID,
+                "ANTHROPIC_API_KEY_FOR_THE_RESEARCH_WORKSTATION_SECOND_FLOOR",
+            ],
+            expect_scroll: true,
+        },
+        SheetCase {
+            name: "sheet-openai-setup",
+            window: (1100., 860.),
+            provider: Provider::Openai,
+            choice: Choice::Observe,
+            flow: step_two(1, false),
+            fields: [LONG_LABEL, "", ""],
+            expect_scroll: false,
+        },
+        SheetCase {
+            name: "sheet-anthropic-observe-setup",
+            window: (1100., 860.),
+            provider: Provider::Anthropic,
+            choice: Choice::Observe,
+            flow: step_two(3, false),
+            fields: ["Personal", "", ""],
+            expect_scroll: false,
+        },
+        SheetCase {
+            name: "sheet-anthropic-pool-setup",
+            window: (1100., 860.),
+            provider: Provider::Anthropic,
+            choice: Choice::Pool,
+            flow: step_two(3, false),
+            fields: ["Work", "", ""],
+            expect_scroll: false,
+        },
+        SheetCase {
+            name: "sheet-openai-key-setup",
+            window: (1100., 860.),
+            provider: Provider::Openai,
+            choice: Choice::Key,
+            flow: step_two(4, false),
+            fields: ["Key A", "", ""],
+            expect_scroll: false,
+        },
+        // Same width as the reconnect case below, which must lack Back.
+        SheetCase {
+            name: "sheet-openai-setup-narrow",
+            window: (420., 520.),
+            provider: Provider::Openai,
+            choice: Choice::Observe,
+            flow: step_two(1, false),
+            fields: [LONG_LABEL, "", ""],
+            expect_scroll: true,
+        },
+        SheetCase {
+            name: "sheet-reconnect-error-narrow",
+            window: (420., 520.),
+            provider: Provider::Openai,
+            choice: Choice::Observe,
+            flow: {
+                let mut f = step_two(2, true);
+                f.on_event(&ConnectEvent::Failed {
+                    op: 2,
+                    message: "Couldn't prepare setup values: account openai-personal-research-workstation-second-floor isn't in the running configuration yet.".into(),
+                });
+                f
+            },
+            fields: [LONG_LABEL, "", ""],
+            expect_scroll: true,
+        },
+    ]
+}
+
+fn rgb255(c: gpui::Rgba) -> [f32; 3] {
+    [c.r * 255.0, c.g * 255.0, c.b * 255.0]
+}
+
+fn near(p: [u8; 4], c: gpui::Rgba, tol: f32) -> bool {
+    let c = rgb255(c);
+    (0..3).all(|i| (p[i] as f32 - c[i]).abs() <= tol)
+}
+
+/// True when `p` lies on the straight colour line from `a` to `b`.
+fn on_line(p: [u8; 4], a: gpui::Rgba, b: gpui::Rgba, tol: f32) -> bool {
+    let (a, b) = (rgb255(a), rgb255(b));
+    (0..=20).any(|i| {
+        let k = i as f32 / 20.0;
+        (0..3).all(|c| ((a[c] + (b[c] - a[c]) * k) - p[c] as f32).abs() <= tol)
+    })
+}
+
+/// Renders the real sheet inside the main window's overlay and checks it
+/// against the window: it fits, its footer is pinned and shows the primary
+/// action, nothing paints into its side padding, and short windows scroll
+/// the body instead of pushing the footer out.
+fn connect_sheets(
+    cx: &mut HeadlessAppContext,
+    t: &Theme,
+    suffix: &str,
+    results: &mut Vec<Checked>,
+) {
+    // Left edge of the footer's buttons, per case.
+    let mut actions_left = std::collections::HashMap::new();
+    for case in sheet_cases() {
+        let overview = adapter::overview(
+            &fixture_snapshot(RoutingStatus::Running {
+                addr: "127.0.0.1:8787".parse().unwrap(),
+            }),
+            fixture_through(),
+            "127.0.0.1:8787",
+        );
+        let store = cx.update(|cx| {
+            cx.new(|_| {
+                let mut s = Store::new(overview, None);
+                s.tab = Tab::Accounts;
+                s.push_connect_event(ConnectEvent::Setup {
+                    op: 1,
+                    setup: Setup {
+                        account_id: "openai-dev".into(),
+                        lines: vec![
+                            "-c model_provider=\"relay\"".into(),
+                            "-c model_providers.relay.base_url=\"http://127.0.0.1:8787/v1\"".into(),
+                            "-c model_providers.relay.wire_api=\"responses\"".into(),
+                            "-c model_providers.relay.env_http_headers={\"X-Relay-Account\"=\"RELAY_ACCOUNT_PERSONAL_RESEARCH_WORKSTATION\"}".into(),
+                        ],
+                        notes: vec!["Leave OPENAI_API_KEY unset in that instance; Relay supplies the account.".into()],
+                    },
+                });
+                s.push_connect_event(ConnectEvent::Setup {
+                    op: 3,
+                    setup: Setup {
+                        account_id: "anthropic-personal".into(),
+                        lines: vec![
+                            "ANTHROPIC_BASE_URL=http://127.0.0.1:8787".into(),
+                            "ANTHROPIC_CUSTOM_HEADERS=X-Relay-Account: anthropic-personal".into(),
+                        ],
+                        notes: vec![],
+                    },
+                });
+                s.push_connect_event(ConnectEvent::Setup {
+                    op: 4,
+                    setup: Setup {
+                        account_id: "openai-key-a".into(),
+                        lines: vec!["OPENAI_BASE_URL=http://127.0.0.1:8787/v1".into()],
+                        notes: vec![],
+                    },
+                });
+                s
+            })
+        });
+        let (w, h) = case.window;
+        let sheet = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = sheet.clone();
+        let handle = cx
+            .open_window(size(px(w), px(h)), |window, cx| {
+                cx.new(|cx| {
+                    let mut d = Dashboard::new(store.clone(), window, cx);
+                    let s = cx.new(|cx| {
+                        ConnectSheet::fixture(
+                            store.clone(),
+                            case.provider,
+                            case.choice,
+                            case.flow.clone(),
+                            case.fields,
+                            window,
+                            cx,
+                        )
+                    });
+                    *slot.borrow_mut() = Some(s.clone());
+                    d.connect = Some(s);
+                    d
+                })
+            })
+            .expect("open sheet");
+        let sheet = sheet.borrow().clone().expect("sheet");
+        // Focus the credential field, as when typing a long path: its end
+        // must scroll into view. Focus stays inside this offscreen window.
+        let focus = cx.update(|cx| sheet.read(cx).credential_input().focus_handle(cx));
+        let _ = cx.update_window(handle.into(), |_, window, cx| window.focus(&focus, cx));
+        cx.run_until_parked();
+        // Twice: scroll and caret offsets settle from the first frame's layout.
+        for _ in 0..2 {
+            let _ = cx.update_window(handle.into(), |_, window, _| window.refresh());
+            cx.run_until_parked();
+        }
+        let img = cx.capture_screenshot(handle.into()).expect("capture sheet");
+        let name = case.name;
+        not_blank(&img, name);
+        save(&img, &format!("{name}-{suffix}"));
+
+        let scale = img.width() as f32 / w;
+        let sw = (w - 48.).min(SHEET_MAX_WIDTH);
+        let x0 = (w - sw) / 2.;
+        let at = |v: f32| (v * scale) as u32;
+        // Sheet extent from a column inside its left padding.
+        let col = at(x0 + 10.);
+        let top = (0..img.height())
+            .find(|&y| near(img.get_pixel(col, y).0, t.surface, 2.))
+            .unwrap_or_else(|| panic!("{name}: sheet surface not found"));
+        let bottom = (0..img.height())
+            .rev()
+            .find(|&y| near(img.get_pixel(col, y).0, t.inset, 2.))
+            .unwrap_or_else(|| panic!("{name}: pinned footer not found"));
+        assert!(
+            bottom < img.height() - at(16.),
+            "{name}: footer runs off the window ({bottom} of {})",
+            img.height()
+        );
+        // The primary action is drawn inside the footer, at its right end.
+        let band = bottom.saturating_sub(at(48.))..bottom;
+        let (pa, pb) = t.primary();
+        let primary = band
+            .clone()
+            .flat_map(|y| (at(x0 + sw / 2.)..at(x0 + sw)).map(move |x| (x, y)))
+            .filter(|&(x, y)| on_line(img.get_pixel(x, y).0, pa, pb, 6.))
+            .count();
+        assert!(
+            primary > (40. * scale * scale) as usize,
+            "{name}: primary button not visible in the footer"
+        );
+        // Footer buttons start where the first non-footer pixel appears on
+        // the footer's middle row.
+        let footer_top = (0..bottom)
+            .rev()
+            .find(|&y| !near(img.get_pixel(col, y).0, t.inset, 2.))
+            .expect("footer top");
+        let mid = (footer_top + bottom) / 2;
+        let left = (col..at(x0 + sw))
+            .find(|&x| !near(img.get_pixel(x, mid).0, t.inset, 3.))
+            .expect("footer buttons");
+        actions_left.insert(name, left as f32 / scale);
+        // A step 1 error shows on arrival, pinned above the footer, without
+        // scrolling.
+        if case.flow.step == 1 && case.flow.error.is_some() {
+            let band = footer_top.saturating_sub(at(90.))..footer_top;
+            let inner = at(x0 + 30.)..at(x0 + sw - 30.);
+            let error = band
+                .flat_map(|y| inner.clone().map(move |x| (x, y)))
+                .filter(|&(x, y)| near(img.get_pixel(x, y).0, t.tag_ember, 2.))
+                .count();
+            assert!(
+                error > (400. * scale * scale) as usize,
+                "{name}: error not visible on arrival ({error} px)"
+            );
+        }
+        // Side padding holds only the sheet's two tonal fills: any text,
+        // field or card crossing it shows up as another colour.
+        for x in [at(x0 + 10.), at(x0 + sw - 10.)] {
+            for y in top + at(18.)..bottom - at(18.) {
+                let p = img.get_pixel(x, y).0;
+                assert!(
+                    on_line(p, t.surface, t.inset, 3.),
+                    "{name}: content crosses the sheet padding at ({x},{y}): {p:?}"
+                );
+            }
+        }
+        let (overflow, cred_scroll, cred_width) = cx.update(|cx| {
+            let s = sheet.read(cx);
+            let input = s.credential_input().read(cx);
+            (s.body_overflow(), input.scroll_x(), input.text_width())
+        });
+        assert_eq!(
+            overflow > px(0.),
+            case.expect_scroll,
+            "{name}: body overflow {overflow:?}"
+        );
+        if case.expect_scroll {
+            check_scrolled_to_end(cx, handle.into(), &sheet, t, (x0, sw, scale), name, suffix);
+        }
+        // A long credential scrolls so its end (and the caret) is visible.
+        if case.flow.step == 1 && case.fields[2].len() > 40 {
+            let width = cred_width.expect("credential laid out");
+            assert!(
+                cred_scroll > px(0.),
+                "{name}: long credential didn't scroll"
+            );
+            assert!(
+                width - cred_scroll <= px(sw - 48. - 24.),
+                "{name}: credential end is out of view"
+            );
+            // IME geometry for the last character must land inside the
+            // field's text area (sheet padding 24 + field padding 12), where
+            // it is drawn, not where it would be unscrolled.
+            let len = case.fields[2].len();
+            let input = cx.update(|cx| sheet.read(cx).credential_input().clone());
+            let ime = cx
+                .update_window(handle.into(), |_, window, cx| {
+                    input.update(cx, |i, cx| {
+                        i.bounds_for_range(len - 1..len, gpui::Bounds::default(), window, cx)
+                    })
+                })
+                .expect("window")
+                .expect("ime bounds");
+            let (lo, hi) = (px(x0 + 36. - 1.), px(x0 + sw - 36. + 1.));
+            assert!(
+                ime.left() >= lo && ime.right() <= hi,
+                "{name}: IME bounds {ime:?} outside the field text area {lo:?}..{hi:?}"
+            );
+        }
+        results.push(Checked {
+            name,
+            width: img.width(),
+            height: img.height(),
+        });
+        let _ = cx.update_window(handle.into(), |_, window, _| window.remove_window());
+    }
+    // Reconnect isn't an edit flow: same width, same step, but no Back, so
+    // its buttons start at least a Back button's width further right.
+    let (edit, reconnect) = (
+        actions_left["sheet-openai-setup-narrow"],
+        actions_left["sheet-reconnect-error-narrow"],
+    );
+    assert!(
+        reconnect - edit >= 50.,
+        "reconnect footer still shows Back ({edit} vs {reconnect})"
+    );
+}
+
+/// Scrolls a short window's sheet body to its end and checks that the last
+/// content (fields, plus the pinned step 1 error) is in view above the pinned
+/// footer, whose primary action stays in the window.
+fn check_scrolled_to_end(
+    cx: &mut HeadlessAppContext,
+    window: gpui::AnyWindowHandle,
+    sheet: &gpui::Entity<ConnectSheet>,
+    t: &Theme,
+    (x0, sw, scale): (f32, f32, f32),
+    name: &str,
+    suffix: &str,
+) {
+    cx.update(|cx| sheet.read(cx).scroll_body_to_end());
+    let _ = cx.update_window(window, |_, window, _| window.refresh());
+    cx.run_until_parked();
+    let img = cx
+        .capture_screenshot(window)
+        .expect("capture scrolled sheet");
+    save(&img, &format!("{name}-scrolled-{suffix}"));
+    let at = |v: f32| (v * scale) as u32;
+    let col = at(x0 + 10.);
+    let footer_bottom = (0..img.height())
+        .rev()
+        .find(|&y| near(img.get_pixel(col, y).0, t.inset, 2.))
+        .expect("footer after scrolling");
+    let footer_top = (0..footer_bottom)
+        .rev()
+        .find(|&y| !near(img.get_pixel(col, y).0, t.inset, 2.))
+        .expect("footer top");
+    assert!(
+        footer_bottom < img.height() - at(16.),
+        "{name}: footer left the window"
+    );
+    let (pa, pb) = t.primary();
+    let xs = at(x0 + sw / 2.)..at(x0 + sw);
+    let primary = (footer_top..footer_bottom)
+        .flat_map(|y| xs.clone().map(move |x| (x, y)))
+        .filter(|&(x, y)| on_line(img.get_pixel(x, y).0, pa, pb, 6.))
+        .count();
+    assert!(
+        primary > (40. * scale * scale) as usize,
+        "{name}: primary action hidden after scrolling"
+    );
+    // In the visible body just above the footer, count the fills that only
+    // the last content uses: field wells (track) and the error note.
+    let body = footer_top.saturating_sub(at(220.))..footer_top;
+    let inner = at(x0 + 30.)..at(x0 + sw - 30.);
+    let count = |c: gpui::Rgba| {
+        body.clone()
+            .flat_map(|y| inner.clone().map(move |x| (x, y)))
+            .filter(|&(x, y)| near(img.get_pixel(x, y).0, c, 2.))
+            .count()
+    };
+    let min = (400. * scale * scale) as usize;
+    if name.contains("key") {
+        // Step 1 ends with the credential field; the save error is pinned
+        // just above the footer.
+        let error = count(t.tag_ember);
+        assert!(
+            error > min,
+            "{name}: scoped error not reachable ({error} px)"
+        );
+        let wells = count(t.track);
+        assert!(wells > min, "{name}: fields not reachable ({wells} px)");
+    } else {
+        // Step 2 ends with the amber "Not yet tested live" note.
+        let amber = body
+            .clone()
+            .flat_map(|y| inner.clone().map(move |x| (x, y)))
+            .filter(|&(x, y)| near(img.get_pixel(x, y).0, t.amber, 40.))
+            .count();
+        assert!(
+            amber > (20. * scale * scale) as usize,
+            "{name}: last note not reachable"
+        );
+    }
 }

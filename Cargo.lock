@@ -4668,7 +4668,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay-core"
-version = "20261018.1.0"
+version = "20261019.1.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -4678,7 +4678,7 @@ dependencies = [
 
 [[package]]
 name = "relay-desktop"
-version = "20261018.1.0"
+version = "20261019.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4699,7 +4699,7 @@ dependencies = [
 
 [[package]]
 name = "relay-providers"
-version = "20261018.1.0"
+version = "20261019.1.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -4712,7 +4712,7 @@ dependencies = [
 
 [[package]]
 name = "relay-proxy"
-version = "20261018.1.0"
+version = "20261019.1.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -4736,7 +4736,7 @@ dependencies = [
 
 [[package]]
 name = "relay-usage"
-version = "20261018.1.0"
+version = "20261019.1.0"
 dependencies = [
  "chrono",
  "relay-core",

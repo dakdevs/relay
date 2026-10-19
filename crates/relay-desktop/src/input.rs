@@ -6,11 +6,11 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
-    point, prelude::*, px, relative, size,
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::*;
 
@@ -42,6 +42,8 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// How far the text is scrolled left so the caret stays in view.
+    scroll_x: Pixels,
     is_selecting: bool,
 }
 
@@ -407,10 +409,13 @@ impl EntityInputHandler for TextInput {
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
-        bounds: Bounds<Pixels>,
+        _element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        // The scrolled text bounds from the last paint, as hit-testing uses:
+        // the element's own bounds don't include the scroll.
+        let bounds = self.last_bounds?;
         let last_layout = self.last_layout.as_ref()?;
         if last_layout.text != self.content {
             return None;
@@ -457,12 +462,31 @@ impl EntityInputHandler for TextInput {
     }
 }
 
+/// Horizontal scroll that keeps a caret at `caret` (in text coordinates)
+/// inside a `view`-wide field: unchanged while the caret is visible,
+/// otherwise the smallest shift that reveals it, never past the text's end.
+fn scroll_to_caret(scroll: Pixels, caret: Pixels, text_width: Pixels, view: Pixels) -> Pixels {
+    const CARET: Pixels = px(2.);
+    let max = (text_width + CARET - view).max(px(0.));
+    let wanted = if caret < scroll {
+        caret
+    } else if caret + CARET > scroll + view {
+        caret + CARET - view
+    } else {
+        scroll
+    };
+    wanted.clamp(px(0.), max)
+}
+
 struct TextElement {
     input: Entity<TextInput>,
 }
 
 struct PrepaintState {
     line: Option<ShapedLine>,
+    /// Text bounds after scrolling: shifted left by `scroll_x`.
+    text_bounds: Bounds<Pixels>,
+    scroll_x: Pixels,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
 }
@@ -511,6 +535,7 @@ impl Element for TextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let content = input.content.clone();
+        let empty = content.is_empty();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
@@ -565,6 +590,16 @@ impl Element for TextElement {
             .shape_line(display_text, font_size, &runs, None);
 
         let cursor_pos = line.x_for_index(cursor);
+        // Only a focused field follows the caret; at rest it shows its start.
+        let scroll_x = if empty || !input.focus_handle.is_focused(window) {
+            px(0.)
+        } else {
+            scroll_to_caret(input.scroll_x, cursor_pos, line.width, bounds.size.width)
+        };
+        let bounds = Bounds::new(
+            point(bounds.left() - scroll_x, bounds.top()),
+            size(bounds.size.width + scroll_x, bounds.size.height),
+        );
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
@@ -596,6 +631,8 @@ impl Element for TextElement {
         };
         PrepaintState {
             line: Some(line),
+            text_bounds: bounds,
+            scroll_x,
             cursor,
             selection,
         }
@@ -617,29 +654,34 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection)
-        }
         let line = prepaint.line.take().unwrap();
-        line.paint(
-            bounds.origin,
-            window.line_height(),
-            gpui::TextAlign::Left,
-            None,
-            window,
-            cx,
-        )
-        .unwrap();
+        let text_bounds = prepaint.text_bounds;
+        // Scrolled text stays inside the field.
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection)
+            }
+            line.paint(
+                text_bounds.origin,
+                window.line_height(),
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .unwrap();
+            if focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
 
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
-
+        let scroll_x = prepaint.scroll_x;
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
-            input.last_bounds = Some(bounds);
+            input.last_bounds = Some(text_bounds);
+            input.scroll_x = scroll_x;
         });
     }
 }
@@ -695,8 +737,19 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_x: px(0.),
             is_selecting: false,
         }
+    }
+
+    /// How far the text is scrolled left to keep the caret in view.
+    pub fn scroll_x(&self) -> Pixels {
+        self.scroll_x
+    }
+
+    /// Width of the text as last laid out.
+    pub fn text_width(&self) -> Option<Pixels> {
+        self.last_layout.as_ref().map(|l| l.width)
     }
 
     pub fn placeholder_text(&self) -> &str {
@@ -733,4 +786,24 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, ctx),
         KeyBinding::new("ctrl-secondary-space", ShowCharacterPalette, ctx),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caret_stays_visible_with_the_smallest_scroll() {
+        let (text, view) = (px(300.), px(100.));
+        // Short text never scrolls.
+        assert_eq!(scroll_to_caret(px(0.), px(40.), px(60.), view), px(0.));
+        // Caret at the end of long text: its 2 px land on the right edge.
+        assert_eq!(scroll_to_caret(px(0.), px(300.), text, view), px(202.));
+        // Moving left within view keeps the scroll; past the left edge, follows.
+        assert_eq!(scroll_to_caret(px(202.), px(250.), text, view), px(202.));
+        assert_eq!(scroll_to_caret(px(202.), px(150.), text, view), px(150.));
+        assert_eq!(scroll_to_caret(px(150.), px(0.), text, view), px(0.));
+        // A stale scroll after deleting text clamps to the new end.
+        assert_eq!(scroll_to_caret(px(202.), px(120.), px(120.), view), px(22.));
+    }
 }

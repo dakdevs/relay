@@ -5,8 +5,8 @@
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
-    prelude::*, px,
+    Focusable, FontWeight, IntoElement, ParentElement, Render, ScrollHandle, SharedString, Styled,
+    Window, div, prelude::*, px,
 };
 use relay_core::{
     config::{AccountConfig, SecretFormat, SecretRef},
@@ -432,6 +432,8 @@ pub struct ConnectSheet {
     identifier: Entity<TextInput>,
     credential: Entity<TextInput>,
     flow: ConnectFlow,
+    /// The body's scroll state; its max offset says whether it overflows.
+    scroll: ScrollHandle,
     _observe: gpui::Subscription,
 }
 
@@ -575,7 +577,7 @@ impl ConnectSheet {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let label = cx.new(|cx| TextInput::new("Personal", cx));
-        let identifier = cx.new(|cx| TextInput::new("you@example.com (masked when saved)", cx));
+        let identifier = cx.new(|cx| TextInput::new("you@example.com", cx));
         let credential = cx.new(|cx| TextInput::new("", cx));
         let observe = cx.observe(&store, |this, store, cx| {
             let events = store.read(cx).connect_events.clone();
@@ -593,6 +595,7 @@ impl ConnectSheet {
             identifier,
             credential,
             flow: ConnectFlow::fresh(),
+            scroll: ScrollHandle::new(),
             _observe: observe,
         }
     }
@@ -643,24 +646,76 @@ impl ConnectSheet {
         sheet
     }
 
-    fn credential_hint(&self) -> (&'static str, &'static str) {
-        match (self.provider, self.choice) {
-            (_, Choice::Observe) => ("", ""),
+    /// Render fixtures: a sheet in a given state with its fields filled
+    /// (label, identifier, credential). Sends nothing.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fixture(
+        store: Entity<Store>,
+        provider: Provider,
+        choice: Choice,
+        flow: ConnectFlow,
+        fields: [&str; 3],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut sheet = Self::new(store, window, cx);
+        sheet.provider = provider;
+        sheet.choice = choice;
+        sheet.flow = flow;
+        let inputs = [&sheet.label, &sheet.identifier, &sheet.credential];
+        for (input, text) in inputs.into_iter().zip(fields) {
+            input.update(cx, |i, cx| i.set_text(text.to_string(), cx));
+        }
+        sheet
+    }
+
+    /// How far the body scrolls: non-zero when its content is taller than
+    /// the space left above the pinned footer.
+    #[doc(hidden)]
+    pub fn body_overflow(&self) -> gpui::Pixels {
+        self.scroll.max_offset().y
+    }
+
+    /// Scrolls the body to its end, as a user would to reach the last field.
+    #[doc(hidden)]
+    pub fn scroll_body_to_end(&self) {
+        let max = self.scroll.max_offset();
+        self.scroll.set_offset(gpui::point(px(0.), -max.y));
+    }
+
+    /// The credential field, for checking that a long value stays reachable.
+    #[doc(hidden)]
+    pub fn credential_input(&self) -> &Entity<TextInput> {
+        &self.credential
+    }
+
+    /// Label, placeholder and helper for the credential field; Observe
+    /// has none.
+    fn credential_hint(&self) -> Option<(&'static str, &'static str, &'static str)> {
+        Some(match (self.provider, self.choice) {
+            (_, Choice::Observe) => return None,
             (Provider::Anthropic, Choice::Pool) => (
-                "Login file for this account",
-                "Path to that account's Claude Code .credentials.json (its own CLAUDE_CONFIG_DIR)",
+                "Login file",
+                "Path to .credentials.json",
+                "That account's own Claude Code login (its CLAUDE_CONFIG_DIR). Relay saves only the path.",
             ),
             (Provider::Openai, Choice::Pool) => (
-                "Login file for this account",
-                "Path to that account's Codex auth.json (its own CODEX_HOME)",
+                "Login file",
+                "Path to auth.json",
+                "That account's own Codex login (its CODEX_HOME). Relay saves only the path.",
             ),
-            (Provider::Anthropic, Choice::Key) => {
-                ("Environment variable with the key", "ANTHROPIC_API_KEY")
-            }
-            (Provider::Openai, Choice::Key) => {
-                ("Environment variable with the key", "OPENAI_API_KEY")
-            }
-        }
+            (Provider::Anthropic, Choice::Key) => (
+                "Environment variable",
+                "ANTHROPIC_API_KEY",
+                "Relay saves the variable's name, never the key.",
+            ),
+            (Provider::Openai, Choice::Key) => (
+                "Environment variable",
+                "OPENAI_API_KEY",
+                "Relay saves the variable's name, never the key.",
+            ),
+        })
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -722,19 +777,43 @@ impl ConnectSheet {
     }
 }
 
+/// A mode choice: radio, title and one short line. Restrictions that
+/// matter for the choice appear only once it is selected.
+#[allow(clippy::too_many_arguments)]
 fn option_card(
     id: &'static str,
+    mark: Option<Mark>,
     title: &'static str,
-    badge: (&'static str, Tone),
     body: &'static str,
+    detail: (&'static str, gpui::Rgba),
     selected: bool,
     on_select: impl Fn(&mut Window, &mut App) + 'static,
     t: &Theme,
 ) -> impl IntoElement {
+    // Nested fills draw the empty radio as a ring without a stroke.
+    let radio = div()
+        .mt(px(1.))
+        .size(px(18.))
+        .flex_none()
+        .rounded_full()
+        .bg(if selected {
+            t.evergreen
+        } else {
+            widgets::lerp(t.inset, t.faint, 0.6)
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .size(px(if selected { 7. } else { 13. }))
+                .rounded_full()
+                .bg(if selected { t.on_accent } else { t.inset }),
+        );
     div()
         .id(id)
         .role(gpui::Role::RadioButton)
-        .aria_label(SharedString::from(format!("{title}. {body}")))
+        .aria_label(SharedString::from(format!("{title}. {body} {}", detail.0)))
         .aria_toggled(if selected {
             gpui::Toggled::True
         } else {
@@ -743,75 +822,143 @@ fn option_card(
         .focusable()
         .tab_stop(true)
         .flex()
+        .items_start()
         .gap(px(12.))
-        .p(px(14.))
+        .px(px(14.))
+        .py(px(12.))
         .rounded(px(radius::ROW + 1.))
         .bg(if selected { t.focus } else { t.inset })
         .hover(|s| s.bg(if selected { t.focus } else { t.hover }))
         .focus_visible(|s| s.bg(t.focus))
         .cursor_pointer()
         .on_click(move |_, w, cx| on_select(w, cx))
+        .child(radio)
         .child(
             div()
-                .mt(px(2.))
-                .size(px(18.))
-                .flex_none()
-                .rounded_full()
-                .bg(if selected { t.evergreen } else { t.track })
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(div().size(px(7.)).rounded_full().bg(if selected {
-                    t.on_accent
-                } else {
-                    t.track
-                })),
-        )
-        .child(
-            div()
+                .flex_1()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
-                .gap(px(4.))
+                .gap(px(2.))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(px(6.))
+                        .children(mark.map(|m| widgets::mark(m, 14., t)))
                         .child(
                             div()
+                                .min_w(px(0.))
                                 .text_size(px(14.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(title),
-                        )
-                        .child(widgets::tag(badge.0, badge.1, t)),
+                        ),
                 )
-                .child(div().text_size(px(12.5)).text_color(t.muted).child(body)),
+                .child(div().text_size(px(12.5)).text_color(t.muted).child(body))
+                .when(selected, |d| {
+                    d.child(
+                        div()
+                            .mt(px(4.))
+                            .text_size(px(12.))
+                            .text_color(detail.1)
+                            .child(detail.0),
+                    )
+                }),
         )
 }
 
-fn field(label: &'static str, input: &Entity<TextInput>, t: &Theme) -> impl IntoElement {
+/// A labelled text field. The box clips its text, so a long value never
+/// paints past the field.
+fn field(
+    label: &'static str,
+    input: &Entity<TextInput>,
+    helper: Option<&'static str>,
+    t: &Theme,
+) -> gpui::Div {
     div()
-        .flex_1()
+        .min_w(px(0.))
         .flex()
         .flex_col()
         .gap(px(6.))
-        .child(div().text_size(px(12.5)).text_color(t.muted).child(label))
         .child(
             div()
-                .h(px(36.))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.muted)
+                .child(label),
+        )
+        .child(
+            div()
+                .h(px(34.))
                 .px(px(12.))
                 .flex()
                 .items_center()
                 .rounded(px(8.))
                 .bg(t.track)
+                .overflow_hidden()
                 .child(input.clone()),
         )
+        .children(helper.map(|h| div().text_size(px(12.)).text_color(t.faint).child(h)))
 }
+
+/// Eyebrow and title. The eyebrow carries user text (the label), so it
+/// truncates; the title wraps.
+fn heading(eyebrow: String, title: &'static str, t: &Theme) -> impl IntoElement {
+    div()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(12.5))
+                .text_color(t.muted)
+                .truncate()
+                .child(eyebrow),
+        )
+        .child(
+            div()
+                .text_size(px(18.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
+}
+
+/// A scoped error: wraps inside the sheet on a soft ember fill.
+fn error_note(text: String, t: &Theme) -> impl IntoElement {
+    div()
+        .id("connect-error")
+        .role(gpui::Role::Alert)
+        .px(px(12.))
+        .py(px(9.))
+        .rounded(px(radius::ROW))
+        .bg(t.tag_ember)
+        .text_size(px(12.5))
+        .text_color(t.ember)
+        .child(text)
+}
+
+/// The dimmed backdrop that centres the sheet in the main window. Its
+/// padding keeps the sheet off the window edges at any size.
+pub fn overlay(sheet: Entity<ConnectSheet>, t: &Theme) -> gpui::Div {
+    div()
+        .absolute()
+        .size_full()
+        .p(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::hsla(0., 0., 0., if t.dark { 0.45 } else { 0.18 }))
+        .child(sheet)
+}
+
+/// Widest the sheet gets; narrower windows shrink it.
+pub const SHEET_MAX_WIDTH: f32 = 540.;
 
 impl Render for ConnectSheet {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = ui(cx).theme;
-        let body = if self.flow.step == 1 {
+        let (content, buttons) = if self.flow.step == 1 {
             self.step_one(cx)
         } else {
             self.step_two(cx)
@@ -826,7 +973,11 @@ impl Render for ConnectSheet {
                     cx.emit(Dismiss);
                 }
             }))
-            .w(px(580.))
+            .w_full()
+            .max_w(px(SHEET_MAX_WIDTH))
+            .max_h_full()
+            .flex()
+            .flex_col()
             .bg(t.surface)
             .rounded(px(16.))
             .shadow(vec![gpui::BoxShadow {
@@ -836,24 +987,53 @@ impl Render for ConnectSheet {
                 spread_radius: px(-8.),
                 inset: false,
             }])
-            .overflow_hidden()
-            .child(body)
+            // The body scrolls; the footer stays pinned and reachable.
+            .child(
+                div()
+                    .id("connect-body")
+                    .track_scroll(&self.scroll)
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .px(px(24.))
+                    .pt(px(22.))
+                    .pb(px(20.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .child(content),
+            )
+            // A step 1 error is pinned above the footer so it shows on
+            // arrival, however far the body is scrolled.
+            .children(
+                (self.flow.step == 1)
+                    .then(|| self.flow.error.clone())
+                    .flatten()
+                    .map(|e| {
+                        div()
+                            .flex_none()
+                            .px(px(24.))
+                            .pb(px(14.))
+                            .child(error_note(e, &t))
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .px(px(24.))
+                    .py(px(14.))
+                    .bg(t.inset)
+                    // GPUI doesn't clip children to rounded corners.
+                    .rounded_b(px(16.))
+                    .children(buttons),
+            )
     }
 }
 
 impl ConnectSheet {
-    fn footer(&self, buttons: Vec<AnyElement>, t: &Theme) -> impl IntoElement {
-        div()
-            .flex()
-            .justify_end()
-            .gap(px(8.))
-            .px(px(24.))
-            .py(px(16.))
-            .bg(t.inset)
-            .children(buttons)
-    }
-
-    fn step_one(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn step_one(&mut self, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
         let t = ui(cx).theme;
         let entity = cx.entity();
         // The provider is part of a saved account's identity: once saved,
@@ -875,11 +1055,12 @@ impl ConnectSheet {
                 })
                 .when(!locked, |d| d.focusable().tab_stop(true).cursor_pointer())
                 .flex_1()
+                .min_w(px(0.))
                 .flex()
                 .items_center()
                 .gap(px(10.))
-                .h(px(48.))
-                .px(px(16.))
+                .h(px(44.))
+                .px(px(14.))
                 .rounded(px(radius::ROW + 1.))
                 .bg(if sel { t.focus } else { t.inset })
                 .hover(|s| s.bg(if sel { t.focus } else { t.hover }))
@@ -895,20 +1076,11 @@ impl ConnectSheet {
                 .child(widgets::mark(provider_mark(p), 18., &t))
                 .child(
                     div()
-                        .text_size(px(15.))
+                        .text_size(px(14.))
                         .font_weight(FontWeight::MEDIUM)
+                        .truncate()
                         .child(p.label()),
                 )
-        };
-        let (product_mark, product) = match self.provider {
-            Provider::Anthropic => (
-                Mark::Claude,
-                "Claude subscription · Max or Pro, or a Console API key",
-            ),
-            Provider::Openai => (
-                Mark::ChatGpt,
-                "ChatGPT plan used by Codex, or a Platform API key",
-            ),
         };
         let choose = |c: Choice, entity: Entity<Self>| {
             move |_: &mut Window, cx: &mut App| {
@@ -918,103 +1090,137 @@ impl ConnectSheet {
                 })
             }
         };
-        let observe_badge = match self.provider {
-            Provider::Anthropic => ("Documented path", Tone::Neutral),
-            Provider::Openai => ("T3 Existing setup · untested", Tone::Neutral),
+        // The plan mark sits on Pool, the one mode that is about plans.
+        let (plan_mark, pool_title, key_title, observe_detail) = match self.provider {
+            Provider::Anthropic => (
+                Mark::Claude,
+                "Pool my own Claude accounts",
+                "Use an Anthropic API key",
+                (
+                    "Documented path. Relay never switches the account.",
+                    t.muted,
+                ),
+            ),
+            Provider::Openai => (
+                Mark::ChatGpt,
+                "Pool my own ChatGPT accounts",
+                "Use an OpenAI API key",
+                (
+                    "Needs a T3 instance with Existing setup. Not yet tested live.",
+                    t.amber,
+                ),
+            ),
         };
-        let (cred_label, cred_hint) = self.credential_hint();
-        if !cred_hint.is_empty() {
+        let cred = self.credential_hint();
+        if let Some((_, placeholder, _)) = cred {
             self.credential.update(cx, |c, cx| {
-                if c.placeholder_text() != cred_hint {
-                    c.set_placeholder(cred_hint, cx);
+                if c.placeholder_text() != placeholder {
+                    c.set_placeholder(placeholder, cx);
                 }
             });
         }
-        let cancel = cx.listener(|_, _, _, cx| cx.emit(Dismiss));
-        let submit = cx.listener(|this, _, _, cx| this.submit(cx));
-        div()
+        let content = div()
             .flex()
             .flex_col()
+            .gap(px(14.))
+            .child(heading("Step 1 of 2".into(), "Connect an account", &t))
             .child(
                 div()
-                    .p(px(24.))
+                    .flex()
+                    .gap(px(8.))
+                    .child(provider_card(
+                        Provider::Anthropic,
+                        self.provider == Provider::Anthropic,
+                        entity.clone(),
+                    ))
+                    .child(provider_card(
+                        Provider::Openai,
+                        self.provider == Provider::Openai,
+                        entity.clone(),
+                    )),
+            )
+            .child(
+                div()
+                    .id("connect-modes")
+                    .role(gpui::Role::RadioGroup)
+                    .aria_label("Mode")
                     .flex()
                     .flex_col()
-                    .gap(px(14.))
-                    .child(div().text_size(px(12.5)).text_color(t.muted).child("Step 1 of 2"))
-                    .child(div().mt(px(-10.)).text_size(px(19.)).font_weight(FontWeight::SEMIBOLD).child("Connect an account"))
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.))
-                            .child(provider_card(Provider::Anthropic, self.provider == Provider::Anthropic, entity.clone()))
-                            .child(provider_card(Provider::Openai, self.provider == Provider::Openai, entity.clone())),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(widgets::mark(product_mark, 15., &t))
-                            .child(div().text_size(px(13.)).text_color(t.muted).child(product)),
-                    )
+                    .gap(px(6.))
                     .child(option_card(
                         "choice-observe",
+                        None,
                         "Observe a T3 instance",
-                        observe_badge,
-                        "The instance keeps its own login. Relay records usage and quota and never switches the account.",
+                        "T3 keeps its own login. Relay records usage and quota.",
+                        observe_detail,
                         self.choice == Choice::Observe,
                         choose(Choice::Observe, entity.clone()),
                         &t,
                     ))
                     .child(option_card(
                         "choice-pool",
-                        "Pool my own subscription accounts",
-                        ("Opt-in · terms unresolved", Tone::Amber),
-                        "Relay gives each new session the account with the most headroom; running sessions stay on their account. Provider terms neither clearly allow nor forbid this for one person's own accounts.",
+                        Some(plan_mark),
+                        pool_title,
+                        "Each new session goes to the account with the most headroom.",
+                        (
+                            "Opt-in. Running sessions stay on their account. Provider terms neither clearly allow nor forbid pooling one person's own accounts.",
+                            t.amber,
+                        ),
                         self.choice == Choice::Pool,
                         choose(Choice::Pool, entity.clone()),
                         &t,
                     ))
                     .child(option_card(
                         "choice-key",
-                        "Use an API key",
-                        ("Billed to the key", Tone::Neutral),
-                        "Relay reads the key from an environment variable you name. Usage is billed to that key, not to a subscription.",
+                        None,
+                        key_title,
+                        "Relay reads the key from an environment variable you name.",
+                        ("Billed to the key, not to a subscription.", t.muted),
                         self.choice == Choice::Key,
                         choose(Choice::Key, entity.clone()),
                         &t,
-                    ))
+                    )),
+            )
+            .child(
+                // Side by side when there's room, stacked when narrow.
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(12.))
                     .child(
-                        div()
-                            .flex()
-                            .gap(px(12.))
-                            .child(field("Label (shown everywhere)", &self.label, &t))
-                            .child(field("Identifier shown as", &self.identifier, &t)),
+                        field("Label", &self.label, Some("Shown in the tray, ledger and usage."), &t)
+                            .flex_grow(1.)
+                            .flex_basis(px(200.)),
                     )
-                    .when(self.choice != Choice::Observe, |d| d.child(field(cred_label, &self.credential, &t)))
-                    .children(
-                        self.flow
-                            .error
-                            .clone()
-                            .map(|e| div().text_size(px(13.)).text_color(t.ember).child(e)),
+                    .child(
+                        field("Identifier", &self.identifier, Some("Optional. Masked when saved."), &t)
+                            .flex_grow(1.)
+                            .flex_basis(px(200.)),
                     ),
             )
-            .child(self.footer(
-                vec![
-                    Button::new("connect-cancel", ButtonKind::Secondary, "Cancel").label("Cancel").on_click(cancel).into_any_element(),
-                    Button::new("connect-continue", ButtonKind::Primary, "Continue")
-                        .label(if self.flow.saving() { "Saving…" } else { "Continue" })
-                        .disabled(self.flow.saving())
-                        .on_click(submit)
-                        .into_any_element(),
-                ],
-                &t,
-            ))
-            .into_any_element()
+            .children(cred.map(|(label, _, helper)| field(label, &self.credential, Some(helper), &t)))
+            .into_any_element();
+        let cancel = cx.listener(|_, _, _, cx| cx.emit(Dismiss));
+        let submit = cx.listener(|this, _, _, cx| this.submit(cx));
+        let buttons = vec![
+            Button::new("connect-cancel", ButtonKind::Secondary, "Cancel")
+                .label("Cancel")
+                .on_click(cancel)
+                .into_any_element(),
+            Button::new("connect-continue", ButtonKind::Primary, "Continue")
+                .label(if self.flow.saving() {
+                    "Saving…"
+                } else {
+                    "Continue"
+                })
+                .disabled(self.flow.saving())
+                .on_click(submit)
+                .into_any_element(),
+        ];
+        (content, buttons)
     }
 
-    fn step_two(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn step_two(&mut self, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
         let t = ui(cx).theme;
         let store = self.store.read(cx);
         let id = self.flow.saved_id.clone().unwrap_or_default();
@@ -1057,10 +1263,10 @@ impl ConnectSheet {
             };
             div()
                 .flex()
+                .items_start()
                 .gap(px(10.))
                 .child(
                     div()
-                        .mt(px(1.))
                         .size(px(20.))
                         .flex_none()
                         .rounded_full()
@@ -1079,6 +1285,8 @@ impl ConnectSheet {
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.))
                         .flex()
                         .flex_col()
                         .gap(px(2.))
@@ -1089,92 +1297,123 @@ impl ConnectSheet {
                 )
         };
         let copy_text = setup.as_ref().map(|s| s.lines.join("\n"));
+        let content = div()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(heading(
+                format!("Step 2 of 2 · {} · {mode} · “{label}”", self.provider.label()),
+                title,
+                &t,
+            ))
+            .child(check(
+                Some(listening),
+                if listening {
+                    format!("Relay is listening on {address}")
+                } else {
+                    format!("Relay is not listening on {address}")
+                },
+                None,
+            ))
+            .when(
+                self.provider == Provider::Openai && self.choice == Choice::Observe,
+                |d| {
+                    d.child(check(
+                        None,
+                        "The T3 instance must use Existing setup".into(),
+                        Some("Managed Codex ignores custom provider settings. In T3, use an instance with Existing setup, then add the launch arguments below.".into()),
+                    ))
+                },
+            )
+            .child(match (&setup, &error) {
+                // Command lines never wrap mid-argument; long ones scroll sideways.
+                (Some(s), _) => div()
+                    .id("setup-lines")
+                    .role(gpui::Role::Document)
+                    .aria_label(SharedString::from(s.lines.join(". ")))
+                    .bg(t.inset)
+                    .rounded(px(radius::ROW))
+                    .overflow_x_scroll()
+                    .child(
+                        div()
+                            .p(px(14.))
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap(px(3.))
+                            .font_family("Menlo")
+                            .text_size(px(12.))
+                            .children(
+                                s.lines
+                                    .iter()
+                                    .map(|l| div().flex_none().whitespace_nowrap().child(l.clone())),
+                            ),
+                    )
+                    .into_any_element(),
+                (None, Some(e)) => error_note(e.clone(), &t).into_any_element(),
+                (None, None) => div()
+                    .text_size(px(13.))
+                    .text_color(t.muted)
+                    .child("Preparing setup values…")
+                    .into_any_element(),
+            })
+            .children(
+                setup
+                    .iter()
+                    .flat_map(|s| s.notes.clone())
+                    .map(|n| div().text_size(px(12.5)).text_color(t.muted).child(n)),
+            )
+            .child(check(
+                seen.then_some(true),
+                if seen {
+                    "First request received".into()
+                } else {
+                    "Waiting for the first request…".into()
+                },
+                Some("Run any prompt in that T3 thread. Quota appears after the first response.".into()),
+            ))
+            .when(self.provider == Provider::Openai, |d| {
+                d.child(div().text_size(px(12.5)).text_color(t.amber).child(
+                    "Not yet tested live. With a custom provider, T3's own Codex account and plan display may not appear for this instance.",
+                ))
+            })
+            .into_any_element();
         let back = cx.listener(|this, _, _, cx| {
             this.flow.back();
             cx.notify();
         });
-        let reconnect = self.flow.reconnect;
         let done = cx.listener(|_, _, _, cx| cx.emit(Dismiss));
-        div()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .p(px(24.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(14.))
-                    .child(div().text_size(px(12.5)).text_color(t.muted).child(format!(
-                        "Step 2 of 2 · {} · {mode} · “{label}”",
-                        self.provider.label()
-                    )))
-                    .child(div().mt(px(-10.)).text_size(px(19.)).font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(check(
-                        Some(listening),
-                        if listening { format!("Relay is listening on {address}") } else { format!("Relay is not listening on {address}") },
-                        None,
-                    ))
-                    .when(self.provider == Provider::Openai && self.choice == Choice::Observe, |d| {
-                        d.child(check(
-                            None,
-                            "The T3 instance must use Existing setup".into(),
-                            Some("Managed Codex ignores custom provider settings. In T3, use an instance with Existing setup, then add the launch arguments below.".into()),
-                        ))
+        let buttons = [
+            // Reconnect isn't an edit flow, so it has no Back.
+            (!self.flow.reconnect).then(|| {
+                Button::new("connect-back", ButtonKind::Secondary, "Back")
+                    .label("Back")
+                    .on_click(back)
+                    .into_any_element()
+            }),
+            Some(
+                Button::new("connect-copy", ButtonKind::Secondary, "Copy setup values")
+                    .label("Copy values")
+                    .icon("icons/copy.svg")
+                    .disabled(copy_text.is_none())
+                    .on_click(move |_, _, cx| {
+                        if let Some(text) = &copy_text {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        }
                     })
-                    .child(match (&setup, &error) {
-                        (Some(s), _) => div()
-                            .id("setup-lines")
-                            .role(gpui::Role::Document)
-                            .aria_label(SharedString::from(s.lines.join(". ")))
-                            .bg(t.inset)
-                            .rounded(px(9.))
-                            .p(px(14.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.))
-                            .font_family("Menlo")
-                            .text_size(px(12.))
-                            .children(s.lines.iter().map(|l| div().child(l.clone())))
-                            .into_any_element(),
-                        (None, Some(e)) => div().text_size(px(13.)).text_color(t.ember).child(e.clone()).into_any_element(),
-                        (None, None) => div().text_size(px(13.)).text_color(t.muted).child("Preparing setup values…").into_any_element(),
-                    })
-                    .children(setup.iter().flat_map(|s| s.notes.clone()).map(|n| div().text_size(px(12.5)).text_color(t.muted).child(n)))
-                    .child(check(
-                        seen.then_some(true),
-                        if seen { "First request received".into() } else { "Waiting for the first request…".into() },
-                        Some("Run any prompt in that T3 thread. Quota appears after the first response.".into()),
-                    ))
-                    .when(self.provider == Provider::Openai, |d| {
-                        d.child(div().text_size(px(12.5)).text_color(t.amber).child(
-                            "Not yet tested live. With a custom provider, T3's own Codex account and plan display may not appear for this instance.",
-                        ))
-                    }),
-            )
-            .child(self.footer(
-                [
-                    // Reconnect isn't an edit flow, so it has no Back.
-                    (!reconnect).then(|| {
-                        Button::new("connect-back", ButtonKind::Secondary, "Back").label("Back").on_click(back).into_any_element()
-                    }),
-                    Some(Button::new("connect-copy", ButtonKind::Secondary, "Copy setup values")
-                        .label("Copy values")
-                        .icon("icons/copy.svg")
-                        .disabled(copy_text.is_none())
-                        .on_click(move |_, _, cx| {
-                            if let Some(text) = &copy_text {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                            }
-                        })
-                        .into_any_element()),
-                    Some(Button::new("connect-done", ButtonKind::Primary, "Done").label("Done").on_click(done).into_any_element()),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
-                &t,
-            ))
-            .into_any_element()
+                    .into_any_element(),
+            ),
+            Some(
+                Button::new("connect-done", ButtonKind::Primary, "Done")
+                    .label("Done")
+                    .on_click(done)
+                    .into_any_element(),
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (content, buttons)
     }
 }
 

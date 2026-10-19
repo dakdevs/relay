@@ -238,16 +238,11 @@ impl Render for Dashboard {
                     .pb(px(24.))
                     .child(body),
             )
-            .children(self.connect.clone().map(|sheet| {
-                div()
-                    .absolute()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui::hsla(0., 0., 0., if t.dark { 0.45 } else { 0.18 }))
-                    .child(sheet)
-            }))
+            .children(
+                self.connect
+                    .clone()
+                    .map(|sheet| accounts::overlay(sheet, &t)),
+            )
     }
 }
 
