@@ -108,6 +108,22 @@ impl Dashboard {
     pub fn open_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.clone();
         let sheet = cx.new(|cx| ConnectSheet::new(store, window, cx));
+        self.show_sheet(sheet, cx);
+    }
+
+    /// Reconnect: the connect sheet on step 2 for an existing account.
+    pub fn open_reconnect(
+        &mut self,
+        account: &crate::model::Account,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let sheet = cx.new(|cx| ConnectSheet::reconnect(store, account, window, cx));
+        self.show_sheet(sheet, cx);
+    }
+
+    fn show_sheet(&mut self, sheet: Entity<ConnectSheet>, cx: &mut Context<Self>) {
         cx.subscribe(&sheet, |this, _, _: &accounts::Dismiss, cx| {
             this.connect = None;
             cx.notify();
@@ -149,16 +165,16 @@ impl Render for Dashboard {
                         .icon("icons/refresh.svg")
                         .label("Refresh all")
                         .disabled(unsupported)
-                        .on_click(move |_, _, cx| store.read(cx).send(Command::RefreshAll))
+                        .on_click(move |_, _, cx| {
+                            store.update(cx, |s, cx| {
+                                s.send_or_report(Command::RefreshAll, crate::store::Scope::App);
+                                cx.notify();
+                            })
+                        })
                         .into_any_element(),
                 )
             }
-            Tab::Accounts => Some(
-                Button::new("connect", ButtonKind::Primary, "Connect an account")
-                    .label("Connect…")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_connect(window, cx)))
-                    .into_any_element(),
-            ),
+            // Board 4 puts Connect… in the Accounts header, not the title bar.
             _ => None,
         };
 

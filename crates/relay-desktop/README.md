@@ -51,8 +51,18 @@ like the Paper design samples. The approved designs are in
 - **Accounts:** the connect sheet stores credential references only (a login
   file path or an environment variable name) and masks identifiers before
   saving. Relay never reads or changes T3 settings. Setup values are shown for
-  copying, with the local key as a placeholder. Each account row offers Pause
-  (no new router-owned sessions; observed clients keep passing) or Resume.
+  copying, with the local key as a placeholder. Each account row offers one action: Resume (paused), Reconnect (opens the
+  connect sheet on its setup step) or a quiet Pause (no new router-owned
+  sessions; observed clients keep passing). Settings changes are sent as
+  single-field edits that the bridge applies to its canonical config, so a
+  stale UI copy can't drop an account or revert a pause. Connect advances only after the bridge confirms the save. Every connect
+  request and reply carries an operation id, so a late reply can't move or
+  cancel the sheet. After Back, Continue merges only the sheet's fields
+  (label, identifier, mode, credential reference) onto the saved account. The
+  provider is locked, and plan, upstream, models, concurrency and pause are
+  untouched. Reconnect has no Back, and it counts only requests newer than
+  when it opened. A command that can't reach the runtime shows its reason
+  instead of waiting.
 - **Motion:** every animation uses ease-out `cubic-bezier(0.23, 1, 0.32, 1)`
   and lasts at most 300 ms. Reversing mid-animation starts from the current
   value. Reduced motion is read from the OS off the UI thread.
@@ -76,9 +86,11 @@ cargo test -j4 -p relay-desktop        # unit tests + offscreen render
 ```
 
 `tests/render.rs` runs without the libtest harness, because AppKit needs the
-main thread. It renders 16 views: four popover states and four main-window
-tabs, each in light and dark. It checks the panel background against the
-theme tokens and writes PNGs to `target/relay-snapshots/`. It shows no
+main thread. It renders 18 views, light and dark: five popover states and
+four main-window tabs. One popover state is a long-title stress case: a
+pixel column inside the sections' right inset must contain only tonal
+surface colours. The test also checks the panel background against the theme
+tokens and writes PNGs to `target/relay-snapshots/`. It shows no
 window, takes no focus, adds no Dock icon, and touches no network, port or
 user file. On Linux it prints `SKIP`.
 

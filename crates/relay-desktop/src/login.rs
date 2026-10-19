@@ -42,10 +42,25 @@ pub fn item_contents(exe: &Path) -> String {
         )
     } else {
         format!(
-            "[Desktop Entry]\nType=Application\nName=Relay\nExec=\"{}\"\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n",
-            exe.replace('"', "\\\"")
+            "[Desktop Entry]\nType=Application\nName=Relay\nExec={}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n",
+            desktop_exec_arg(&exe)
         )
     }
+}
+
+/// Quotes one argument for a Desktop Entry `Exec` key (freedesktop Desktop
+/// Entry spec, "The Exec key"): inside double quotes, `"`, `` ` ``, `$` and
+/// `\` are backslash-escaped; then the general string escape doubles each
+/// backslash; `%` becomes `%%` so it is not read as a field code.
+pub fn desktop_exec_arg(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    for c in arg.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    format!("\"{}\"", quoted.replace('\\', "\\\\").replace('%', "%%"))
 }
 
 pub fn is_enabled(path: &Path) -> bool {
@@ -80,6 +95,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn desktop_exec_quoting_follows_the_spec() {
+        // Plain path: just quoted.
+        assert_eq!(
+            desktop_exec_arg("/opt/relay/relay"),
+            r#""/opt/relay/relay""#
+        );
+        // `"`, `` ` ``, `$` get a quoting backslash, which the string escape
+        // then doubles; a literal backslash becomes four; `%` becomes `%%`.
+        assert_eq!(desktop_exec_arg(r#"/a "b"/r"#), r#""/a \\"b\\"/r""#);
+        assert_eq!(desktop_exec_arg("/a`b$c/r"), r#""/a\\`b\\$c/r""#);
+        assert_eq!(desktop_exec_arg(r"/a\b/r"), r#""/a\\\\b/r""#);
+        assert_eq!(desktop_exec_arg("/50%/r"), r#""/50%%/r""#);
+    }
+
+    #[test]
     fn toggling_writes_and_removes_only_the_item() {
         let dir = std::env::temp_dir().join(format!("relay-login-test-{}", std::process::id()));
         let path = item_path(&dir, Some(&dir.join("xdg")));
@@ -98,7 +128,10 @@ mod tests {
             assert!(text.contains("<key>RunAtLoad</key><true/>"));
         } else {
             assert!(path.ends_with("xdg/autostart/relay.desktop"));
-            assert!(text.contains("Exec=\"/Applications/Relay & Co.app/Contents/MacOS/relay\""));
+            assert!(text.contains(&format!(
+                "Exec={}",
+                desktop_exec_arg("/Applications/Relay & Co.app/Contents/MacOS/relay")
+            )));
         }
         set_enabled(&path, Path::new("/x"), false).unwrap();
         assert!(!is_enabled(&path));

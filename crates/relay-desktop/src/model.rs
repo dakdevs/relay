@@ -62,6 +62,7 @@ pub struct AccountWindow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Account {
     pub id: String,
+    pub provider: relay_core::model::Provider,
     pub label: String,
     pub masked: String,
     pub plan: String,
@@ -316,6 +317,7 @@ pub mod fixtures {
     pub fn account(label: &str, in_use: u32, state: State) -> Account {
         Account {
             id: label.to_lowercase(),
+            provider: relay_core::model::Provider::Anthropic,
             label: label.into(),
             masked: "d••@example.com".into(),
             plan: "Max 20×".into(),

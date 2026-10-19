@@ -82,6 +82,9 @@ pub enum ButtonKind {
     Primary,
     Secondary,
     Icon,
+    /// Flat, muted text action for secondary row actions (Pause): no raised
+    /// surface at rest, a tint on hover, the same inward press.
+    Quiet,
 }
 
 #[derive(Default)]
@@ -186,6 +189,10 @@ impl RenderOnce for Button {
             ButtonKind::Secondary | ButtonKind::Icon => {
                 (t.button_top, t.button_bottom, t.text, t.hover, t.pressed)
             }
+            ButtonKind::Quiet => {
+                let clear = Rgba { a: 0.0, ..t.hover };
+                (clear, clear, t.muted, t.hover, t.pressed)
+            }
         };
         let top = lerp(lerp(top, hover_tint, hover), pressed_bg, press);
         let bottom = lerp(lerp(bottom, hover_tint, hover * 0.6), pressed_bg, press);
@@ -194,7 +201,11 @@ impl RenderOnce for Button {
         } else {
             press
         };
-        let shadow_alpha = t.shadow.a * (1.0 - press);
+        let shadow_alpha = if self.kind == ButtonKind::Quiet {
+            0.0
+        } else {
+            t.shadow.a * (1.0 - press)
+        };
 
         let is_icon = self.kind == ButtonKind::Icon;
         let base = div()
@@ -567,6 +578,39 @@ pub fn switch(
                 }]),
         )
         .on_click(move |_, w, cx| on_toggle(!on, w, cx))
+        .into_any_element()
+}
+
+/// An unavailable switch: drawn off and quiet, not focusable, no pointer
+/// cursor, no handler; assistive tech hears why it is unavailable.
+pub fn switch_disabled(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    reason: impl Into<SharedString>,
+    t: &Theme,
+) -> AnyElement {
+    div()
+        .id(id.into())
+        .role(gpui::Role::Switch)
+        .aria_label(label.into())
+        .aria_description(reason.into())
+        .aria_toggled(gpui::Toggled::False)
+        .flex_none()
+        .w(px(38.))
+        .h(px(22.))
+        .rounded_full()
+        .bg(t.track)
+        .opacity(0.5)
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .top(px(2.))
+                .left(px(2.))
+                .size(px(18.))
+                .rounded_full()
+                .bg(lerp(t.surface, t.track, 0.2)),
+        )
         .into_any_element()
 }
 

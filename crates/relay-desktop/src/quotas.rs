@@ -724,9 +724,13 @@ fn ledger_row(
                             .label("Refresh quota")
                             .disabled(refresh_disabled)
                             .on_click(move |_, _, cx| {
-                                refresh_store
-                                    .read(cx)
-                                    .send(crate::store::Command::RefreshQuota(id.clone()))
+                                refresh_store.update(cx, |s, cx| {
+                                    s.send_or_report(
+                                        crate::store::Command::RefreshQuota(id.clone()),
+                                        crate::store::Scope::App,
+                                    );
+                                    cx.notify();
+                                })
                             }),
                         ),
                 )

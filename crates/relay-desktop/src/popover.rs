@@ -158,18 +158,6 @@ impl Popover {
         cx.notify();
     }
 
-    /// Re-opens while closing (re-click mid-animation reverses).
-    pub fn reopen(&mut self, cx: &mut Context<Self>) {
-        self.closing = false;
-        self.presence.retarget(
-            1.0,
-            motion::POPOVER_OPEN,
-            Instant::now(),
-            ui(cx).reduced_motion,
-        );
-        cx.notify();
-    }
-
     pub fn is_closing(&self) -> bool {
         self.closing
     }
@@ -216,6 +204,7 @@ impl Render for Popover {
         let store = self.store.read(cx);
         let overview = store.overview.clone();
         let paused = store.paused;
+        let app_error = store.error(crate::store::Scope::App).map(str::to_owned);
         let expanded = store.expanded.clone();
         let drop = if reduced { 0.0 } else { -4.0 * (1.0 - p) };
 
@@ -232,6 +221,13 @@ impl Render for Popover {
                 }
                 _ => None,
             })
+            .children(app_error.map(|e| {
+                div()
+                    .px(px(8.))
+                    .text_size(px(12.5))
+                    .text_color(t.ember)
+                    .child(e)
+            }))
             .when(overview.is_empty(), |d| d.child(empty_state(&entity, &t)))
             .children(
                 overview
@@ -322,7 +318,15 @@ impl Render for Popover {
 fn measured_by(parts: &Rc<[Cell<f32>; 3]>, i: usize) -> impl IntoElement {
     let parts = parts.clone();
     canvas(
-        move |bounds, _, _| parts[i].set(f32::from(bounds.size.height)),
+        move |bounds, window, _| {
+            let h = f32::from(bounds.size.height);
+            // Content changed size: draw again so the window follows on the
+            // next frame. Sub-pixel jitter is ignored, so this settles.
+            if (h - parts[i].get()).abs() >= 1.0 {
+                parts[i].set(h);
+                window.refresh();
+            }
+        },
         |_, _, _, _| {},
     )
     .absolute()
@@ -447,13 +451,24 @@ impl Popover {
             )
             .children(g.mark.map(|m| widgets::mark(m, 16., t)))
             .child(
+                // Long plan names truncate; counts, tags and "n stale" keep
+                // their size inside the section's right inset.
                 div()
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .truncate()
                     .text_size(px(15.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(t.text)
                     .child(g.title.clone()),
             )
-            .child(div().text_size(px(12.5)).text_color(t.muted).child(count))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.5))
+                    .text_color(t.muted)
+                    .child(count),
+            )
             .child(widgets::tag(
                 g.mode.text(),
                 if g.mode == crate::model::ModeTag::Observed {
@@ -467,6 +482,7 @@ impl Popover {
             .when(stale > 0, |d| {
                 d.child(
                     div()
+                        .flex_none()
                         .text_size(px(12.5))
                         .text_color(t.amber)
                         .child(format!("{stale} stale")),
@@ -935,7 +951,13 @@ fn not_routing(
                     Button::new("retry", ButtonKind::Secondary, "Try again")
                         .label("Try again")
                         .on_click(move |_, _, cx| {
-                            store.read(cx).send(crate::store::Command::Retry)
+                            store.update(cx, |s, cx| {
+                                s.send_or_report(
+                                    crate::store::Command::Retry,
+                                    crate::store::Scope::App,
+                                );
+                                cx.notify();
+                            })
                         }),
                 )
                 .child(

@@ -273,6 +273,26 @@ fn assert_pixel_near(img: &image::RgbaImage, x: u32, y: u32, expected: gpui::Rgb
     assert!(d <= 3, "{what}: pixel {:?} at ({x},{y}) is not {:?}", p, e);
 }
 
+/// A pixel column 3 pt inside the sections' right edge must be tonal
+/// surface only (popover, section, or a blend at rounded corners): any text,
+/// tag or bar crossing the inset shows up as an off-line colour.
+fn assert_inset_clear(img: &image::RgbaImage, scale: f32, t: &Theme) {
+    let x = ((SHADOW_MARGIN + 360. - 8. - 3.) * scale) as u32;
+    let top = ((SHADOW_MARGIN + 48.) * scale) as u32;
+    // Stop above the panel's rounded bottom edge and outer shadow.
+    let bottom = img.height() - ((SHADOW_MARGIN + 40.) * scale) as u32;
+    let rgb = |c: gpui::Rgba| [c.r * 255.0, c.g * 255.0, c.b * 255.0];
+    let (a, b) = (rgb(t.popover), rgb(t.surface));
+    for y in top..bottom {
+        let p = img.get_pixel(x, y).0;
+        let on_line = (0..=20).any(|i| {
+            let k = i as f32 / 20.0;
+            (0..3).all(|c| ((a[c] + (b[c] - a[c]) * k) - p[c] as f32).abs() <= 8.0)
+        });
+        assert!(on_line, "content crosses the right inset at y={y}: {p:?}");
+    }
+}
+
 fn not_blank(img: &image::RgbaImage, what: &str) {
     let first = img.get_pixel(img.width() / 2, img.height() / 2).0;
     let distinct = img.pixels().filter(|p| p.0 != first).count();
@@ -313,7 +333,7 @@ fn main() {
             relay_desktop::dashboard::bind_keys(cx);
         });
 
-        let cases: [(&'static str, Option<RoutingStatus>, bool); 4] = [
+        let cases: [(&'static str, Option<RoutingStatus>, bool); 5] = [
             (
                 "popover-collapsed",
                 Some(RoutingStatus::Running {
@@ -336,6 +356,14 @@ fn main() {
                 false,
             ),
             ("popover-empty", None, false),
+            // Long plan title plus "n stale": nothing may cross the inset.
+            (
+                "popover-stress",
+                Some(RoutingStatus::Running {
+                    addr: "127.0.0.1:8787".parse().unwrap(),
+                }),
+                false,
+            ),
         ];
         for (name, routing, expanded) in cases {
             let overview = match &routing {
@@ -352,6 +380,23 @@ fn main() {
                             a.state = AccountState::Unknown;
                             a.sessions = 0;
                             a.last_seen = None;
+                            a
+                        })
+                        .collect();
+                    snap.providers = group_accounts(accounts, NOW);
+                    adapter::overview(&snap, fixture_through(), "127.0.0.1:8787")
+                }
+                Some(r) if name == "popover-stress" => {
+                    let mut snap = fixture_snapshot(r.clone());
+                    let accounts: Vec<AccountView> = snap
+                        .providers
+                        .drain(..)
+                        .flat_map(|p| p.groups)
+                        .flat_map(|g| g.accounts)
+                        .map(|mut a| {
+                            if a.provider == Provider::Openai {
+                                a.plan = Some("EnterpriseEducationWorkspaceAnnual".into());
+                            }
                             a
                         })
                         .collect();
@@ -428,6 +473,9 @@ fn main() {
             );
             let file = format!("{name}-{suffix}");
             save(&img, &file);
+            if name == "popover-stress" {
+                assert_inset_clear(&img, scale, &theme);
+            }
             results.push(Checked {
                 name,
                 width: img.width(),

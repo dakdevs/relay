@@ -85,7 +85,8 @@ pub fn view(store: &Entity<Store>, window: &mut Window, cx: &mut App) -> AnyElem
         move |i, _, cx| {
             st.update(cx, |s, cx| {
                 s.usage_range = [Range::Day, Range::Week, Range::Month][i];
-                s.send(Command::UsageRange(s.usage_range));
+                let range = s.usage_range;
+                s.send_or_report(Command::UsageRange(range), crate::store::Scope::App);
                 cx.notify();
             })
         },

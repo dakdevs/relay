@@ -204,9 +204,9 @@ fn account(a: &AccountView, now: UnixMs) -> Account {
     };
     let credits = a.credits.as_ref().and_then(|c| {
         if c.unlimited == Some(true) {
-            Some("Credits: unlimited".to_string())
+            Some("Reset credits: unlimited".to_string())
         } else {
-            c.balance.as_ref().map(|b| format!("Credits: {b}"))
+            c.balance.as_ref().map(|b| format!("Reset credits: {b}"))
         }
     });
     let note = a.state_detail.clone().or_else(|| match a.state {
@@ -223,6 +223,7 @@ fn account(a: &AccountView, now: UnixMs) -> Account {
     });
     Account {
         id: a.id.0.clone(),
+        provider: a.provider,
         label: a.label.clone(),
         masked: a.identifier.clone().unwrap_or_default(),
         plan: a.plan.clone().unwrap_or_else(|| "—".into()),

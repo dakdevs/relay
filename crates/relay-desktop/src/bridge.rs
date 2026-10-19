@@ -24,7 +24,7 @@ use relay_usage::{Range as UsageRange, Reader};
 use crate::{
     adapter,
     model::{Overview, Range, Through, UsageRow},
-    store::{Command, Setup, Store},
+    store::{AccountEdit, Command, ConfigEdit, ConnectEvent, Op, Scope, Setup, Store},
 };
 
 /// Messages from the bridge thread to the UI.
@@ -32,8 +32,9 @@ pub enum Update {
     Overview(Box<Overview>),
     Usage(Vec<UsageRow>),
     Config(Box<Config>),
-    Setup(Setup),
-    Error(String),
+    /// Reply to a correlated connect request.
+    Connect(ConnectEvent),
+    Error(Scope, String),
     Paused(bool),
     /// The proxy drained and stopped; the app may exit.
     Stopped,
@@ -53,7 +54,10 @@ pub fn start(cx: &mut App) -> Entity<Store> {
         .spawn(move || run(cmd_rx, up_tx));
     if let Err(e) = spawned {
         store.update(cx, |s, _| {
-            s.error = Some(format!("Could not start Relay's runtime thread: {e}"))
+            s.set_error(
+                Scope::Routing,
+                format!("Could not start Relay's runtime thread: {e}"),
+            )
         });
     }
     let ui_store = store.clone();
@@ -75,8 +79,8 @@ pub fn start(cx: &mut App) -> Entity<Store> {
                         Update::Overview(o) => s.overview = *o,
                         Update::Usage(rows) => s.usage_rows = rows,
                         Update::Config(c) => s.config = *c,
-                        Update::Setup(setup) => s.setup = Some(setup),
-                        Update::Error(e) => s.error = Some(e),
+                        Update::Connect(event) => s.push_connect_event(event),
+                        Update::Error(scope, e) => s.set_error(scope, e),
                         Update::Paused(p) => s.paused = p,
                         Update::Stopped => {}
                     }
@@ -119,9 +123,10 @@ fn run(mut commands: UnboundedReceiver<Command>, tx: UnboundedSender<Update>) {
     {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = tx.unbounded_send(Update::Error(format!(
-                "Could not start Relay's runtime: {e}"
-            )));
+            let _ = tx.unbounded_send(Update::Error(
+                Scope::Routing,
+                format!("Could not start Relay's runtime: {e}"),
+            ));
             return;
         }
     };
@@ -314,41 +319,112 @@ impl Bridge {
         let _ = self.tx.unbounded_send(Update::Overview(Box::new(overview)));
     }
 
+    /// Applies `edit` to the canonical config, persists it (validated,
+    /// atomic) and hot-applies it. Returns a display-ready error on failure.
     fn save(
         &mut self,
         edit: impl FnOnce(&mut ConfigStore) -> Result<(), relay_proxy::store::StoreError>,
-    ) {
+    ) -> Result<(), String> {
         let Some(store) = self.config_store.as_mut() else {
-            return self.error("Relay's settings are not available".into());
+            return Err("Relay's settings are not available".into());
         };
         if let Err(e) = edit(store) {
-            return self.error(e.to_string());
+            // The canonical config is unchanged; republish it so any
+            // optimistic UI value rolls back to what is actually saved.
+            let canonical = store.config().clone();
+            let _ = self.tx.unbounded_send(Update::Config(Box::new(canonical)));
+            return Err(e.to_string());
         }
         let config = store.config().clone();
+        let mut result = Ok(());
         if let Some(h) = &self.handle {
             match h.apply_config(config.clone()) {
-                Err(errs) => self.error(
-                    errs.iter()
+                Err(errs) => {
+                    result = Err(errs
+                        .iter()
                         .map(|e| e.0.clone())
                         .collect::<Vec<_>>()
-                        .join("; "),
-                ),
+                        .join("; "));
+                }
                 Ok(()) => {
-                    // A new local address restarts the proxy (see SaveConfig);
+                    // A new local address restarts the proxy (see Edit);
                     // anything else that needs a restart is said, not hidden.
-                    let pending = restart_notice(&h.restart_required());
-                    if let Some(notice) = pending {
-                        self.error(notice);
+                    if let Some(notice) = restart_notice(&h.restart_required()) {
+                        self.error(Scope::Routing, notice);
                     }
                 }
             }
         }
         let _ = self.tx.unbounded_send(Update::Config(Box::new(config)));
         self.publish(false);
+        result
     }
 
-    fn error(&self, message: String) {
-        let _ = self.tx.unbounded_send(Update::Error(message));
+    fn error(&self, scope: Scope, message: String) {
+        let _ = self.tx.unbounded_send(Update::Error(scope, message));
+    }
+
+    fn connect(&self, event: ConnectEvent) {
+        let _ = self.tx.unbounded_send(Update::Connect(event));
+    }
+
+    /// Saves an account, then (only on success) reports it and sends its
+    /// setup values, all tagged with `op`. A failure replies `Failed`.
+    fn add_account(&mut self, op: Op, account: AccountConfig) {
+        let id = account.id.0.clone();
+        match self.save(|s| s.add_account(account)) {
+            Ok(()) => {
+                self.connect(ConnectEvent::Saved { op, id: id.clone() });
+                self.send_setup(op, &id);
+            }
+            Err(message) => self.connect(ConnectEvent::Failed { op, message }),
+        }
+    }
+
+    /// Merges sheet-editable fields onto the canonical account. The
+    /// provider is part of the account's identity and can't change here.
+    fn update_account(&mut self, op: Op, id: &str, edit: &AccountEdit) {
+        let Some(existing) = self
+            .config_store
+            .as_ref()
+            .and_then(|s| s.config().account(id).cloned())
+        else {
+            return self.connect(ConnectEvent::Failed {
+                op,
+                message: format!("No account named {id}"),
+            });
+        };
+        let merged = edit.merge_onto(&existing);
+        match self.save(|s| s.replace_account(merged)) {
+            Ok(()) => {
+                self.connect(ConnectEvent::Saved {
+                    op,
+                    id: id.to_string(),
+                });
+                self.send_setup(op, id);
+            }
+            Err(message) => self.connect(ConnectEvent::Failed { op, message }),
+        }
+    }
+
+    fn send_setup(&self, op: Op, id: &str) {
+        match self.handle.as_ref().and_then(|h| h.client_setup(id)) {
+            Some(cs) => self.connect(ConnectEvent::Setup {
+                op,
+                setup: Setup {
+                    account_id: id.to_string(),
+                    lines: setup_lines(&cs.entries),
+                    notes: cs.notes,
+                },
+            }),
+            None => self.connect(ConnectEvent::Failed {
+                op,
+                message: match &self.failure {
+                    Some(f) => format!("Setup values need Relay running: {f}"),
+                    None => format!("No account named {id}"),
+                },
+            }),
+        }
     }
 
     /// Returns true when the proxy was (re)started.
@@ -361,34 +437,27 @@ impl Bridge {
                 }
                 let _ = self.tx.unbounded_send(Update::Paused(p));
             }
-            Command::AddAccount(account) => self.save(|s| s.add_account(*account)),
-            Command::SaveConfig(config) => {
+            Command::AddAccount { op, account } => self.add_account(op, *account),
+            Command::UpdateAccount { op, id, edit } => self.update_account(op, &id, &edit),
+            Command::Edit(edit) => {
                 let before = self.config_store.as_ref().map(|s| s.config().server.listen);
-                let after = config.server.listen;
-                self.save(|s| s.update(|c| *c = *config));
-                let saved = self.config_store.as_ref().map(|s| s.config().server.listen);
+                if let Err(e) = self.save(|s| s.update(|c| edit.apply(c))) {
+                    self.error(Scope::Routing, e);
+                    return false;
+                }
+                let after = self.config_store.as_ref().map(|s| s.config().server.listen);
                 // The listen address is fixed for a handle's life, so a new
                 // address restarts the proxy (draining in-flight requests).
-                if before != Some(after) && saved == Some(after) {
+                if matches!(edit, ConfigEdit::ListenPort(_)) && before != after {
                     return self.restart();
                 }
             }
-            Command::SetAccountPaused { id, paused } => self.save(|s| s.set_paused(&id, paused)),
-            Command::ClientSetup(id) => {
-                match self.handle.as_ref().and_then(|h| h.client_setup(&id)) {
-                    Some(cs) => {
-                        let _ = self.tx.unbounded_send(Update::Setup(Setup {
-                            account_id: id,
-                            lines: setup_lines(&cs.entries),
-                            notes: cs.notes,
-                        }));
-                    }
-                    None => self.error(match &self.failure {
-                        Some(f) => format!("Setup values need Relay running: {f}"),
-                        None => format!("No account named {id}"),
-                    }),
+            Command::SetAccountPaused { id, paused } => {
+                if let Err(e) = self.save(|s| s.set_paused(&id, paused)) {
+                    self.error(Scope::Accounts, e);
                 }
             }
+            Command::ClientSetup { op, id } => self.send_setup(op, &id),
             Command::UsageRange(range) => {
                 self.range = range;
                 self.refresh_usage(true);
@@ -532,16 +601,15 @@ mod tests {
         }
     }
 
-    /// Loopback-only: a temp data dir and ephemeral ports, no user files.
-    #[test]
-    fn applying_a_new_port_restarts_the_proxy_there() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::in_dir(dir.path());
+    /// A bridge over a temp data dir with the proxy on an ephemeral
+    /// loopback port. No user files, no fixed ports.
+    fn test_bridge(dir: &std::path::Path) -> (Bridge, UnboundedReceiver<Update>) {
+        let paths = Paths::in_dir(dir);
         let mut store = ConfigStore::open(&paths).unwrap();
         store
             .update(|c| c.server.listen = "127.0.0.1:0".parse().unwrap())
             .unwrap();
-        let (tx, mut rx) = unbounded();
+        let (tx, rx) = unbounded();
         let mut b = Bridge {
             paths: Some(paths),
             config_store: Some(store),
@@ -559,31 +627,219 @@ mod tests {
             b.handle.is_some(),
             "proxy should start on an ephemeral port"
         );
-        b.command(Command::SetPaused(true));
+        (b, rx)
+    }
 
+    fn on_disk(dir: &std::path::Path) -> Config {
+        relay_proxy::store::load(&dir.join("config.toml")).unwrap()
+    }
+
+    fn drain(rx: &mut UnboundedReceiver<Update>) -> Vec<Update> {
+        let mut out = Vec::new();
+        while let Ok(u) = rx.try_recv() {
+            out.push(u);
+        }
+        out
+    }
+
+    fn observed(id: &str, label: &str) -> AccountConfig {
+        let mut a = cfg_account(id, label, Provider::Anthropic, AccountMode::Observed, false);
+        a.plan = None;
+        a
+    }
+
+    #[test]
+    fn applying_a_new_port_restarts_the_proxy_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut b, _rx) = test_bridge(dir.path());
+        b.command(Command::SetPaused(true));
         // A free port, released before Relay binds it.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        let mut next = b.config_store.as_ref().unwrap().config().clone();
-        next.server.listen.set_port(port);
         assert!(
-            b.command(Command::SaveConfig(Box::new(next))),
+            b.command(Command::Edit(ConfigEdit::ListenPort(port))),
             "port change restarts"
         );
         let h = b.handle.as_ref().expect("restarted");
         assert_eq!(h.addr().port(), port);
         assert!(h.is_paused(), "routing pause survives the restart");
-        // The new address is persisted.
-        let saved = relay_proxy::store::load(&dir.path().join("config.toml")).unwrap();
-        assert_eq!(saved.server.listen.port(), port);
-        // Saving without an address change does not restart.
-        let same = b.config_store.as_ref().unwrap().config().clone();
-        assert!(!b.command(Command::SaveConfig(Box::new(same))));
-        drop(b);
-        while rx.try_recv().is_ok() {}
+        assert_eq!(on_disk(dir.path()).server.listen.port(), port);
+        // The same port again changes nothing and does not restart.
+        assert!(!b.command(Command::Edit(ConfigEdit::ListenPort(port))));
+    }
+
+    /// Regression (review P1): a settings edit made from a UI copy that
+    /// predates an account add or pause must not drop or revert them.
+    #[test]
+    fn stale_ui_settings_edits_never_overwrite_accounts_or_pauses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut b, mut rx) = test_bridge(dir.path());
+        // The UI store still holds the config from before the add.
+        let (ui_tx, mut ui_rx) = unbounded();
+        let mut ui = Store::new(Overview::starting(String::new(), 0), Some(ui_tx));
+        ui.config = b.config_store.as_ref().unwrap().config().clone();
+
+        b.command(Command::AddAccount {
+            op: 1,
+            account: Box::new(observed("anthropic-work", "Work")),
+        });
+        b.command(Command::AddAccount {
+            op: 2,
+            account: Box::new(observed("anthropic-home", "Home")),
+        });
+        b.command(Command::SetAccountPaused {
+            id: "anthropic-home".into(),
+            paused: true,
+        });
+        // Rapid settings edits from the stale copy, delivered in order.
+        let sticky = !ui.config.routing.sticky;
+        ui.edit(ConfigEdit::Sticky(sticky));
+        ui.edit(ConfigEdit::Strategy(
+            relay_core::select::Strategy::RoundRobin,
+        ));
+        ui.edit(ConfigEdit::SkipBelowPct(10.0));
+        while let Ok(cmd) = ui_rx.try_recv() {
+            b.command(cmd);
+        }
+
+        let disk = on_disk(dir.path());
+        let ids: Vec<&str> = disk.accounts.iter().map(|a| a.id.0.as_str()).collect();
+        assert_eq!(ids, ["anthropic-work", "anthropic-home"]);
+        assert!(disk.accounts[1].paused, "pause kept");
+        assert_eq!(disk.routing.sticky, sticky);
+        assert_eq!(
+            disk.routing.strategy,
+            relay_core::select::Strategy::RoundRobin
+        );
+        assert_eq!(disk.routing.skip_below_pct, 10.0);
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|u| matches!(u, Update::Error(..)))
+        );
+    }
+
+    fn saved(u: &Update, op: Op) -> bool {
+        matches!(u, Update::Connect(ConnectEvent::Saved { op: o, .. }) if *o == op)
+    }
+
+    fn setup_for(u: &Update, op: Op) -> bool {
+        matches!(u, Update::Connect(ConnectEvent::Setup { op: o, .. }) if *o == op)
+    }
+
+    fn failed(u: &Update, op: Op) -> bool {
+        matches!(u, Update::Connect(ConnectEvent::Failed { op: o, .. }) if *o == op)
+    }
+
+    /// Regression (review r1 P2, r2 P2): Back→Continue and Reconnect edits
+    /// merge onto the canonical account. Custom fields the sheet doesn't show
+    /// survive, the provider can't change, and no second account appears.
+    #[test]
+    fn account_edits_merge_and_never_duplicate_or_drop_custom_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut b, mut rx) = test_bridge(dir.path());
+        let mut custom = observed("anthropic-dev", "Dev");
+        custom.identifier = Some("d••@acme.co".into());
+        custom.models = vec!["claude-opus-*".into()];
+        custom.max_in_flight = 3;
+        custom.upstream = Some(relay_core::config::ANTHROPIC_API.into());
+        custom.plan = Some("Max 20×".into());
+        b.command(Command::AddAccount {
+            op: 7,
+            account: Box::new(custom.clone()),
+        });
+        b.command(Command::SetAccountPaused {
+            id: "anthropic-dev".into(),
+            paused: true,
+        });
+        let first = drain(&mut rx);
+        let s = first.iter().position(|u| saved(u, 7));
+        let p = first.iter().position(|u| setup_for(u, 7));
+        assert!(
+            s.is_some() && p.is_some() && s < p,
+            "saved, then setup, same op"
+        );
+
+        // Back (or Reconnect) → rename → Continue.
+        let edit = AccountEdit {
+            label: "Dev laptop".into(),
+            identifier: None,
+            mode: AccountMode::Observed,
+            credential: None,
+            credential_kind: None,
+        };
+        b.command(Command::UpdateAccount {
+            op: 8,
+            id: "anthropic-dev".into(),
+            edit: Box::new(edit.clone()),
+        });
+        assert!(drain(&mut rx).iter().any(|u| saved(u, 8)));
+        let disk = on_disk(dir.path());
+        assert_eq!(disk.accounts.len(), 1, "no second account");
+        let a = &disk.accounts[0];
+        assert_eq!(a.label, "Dev laptop");
+        assert_eq!(a.provider, Provider::Anthropic, "provider unchanged");
+        assert_eq!(
+            (
+                &a.identifier,
+                &a.models,
+                a.max_in_flight,
+                &a.upstream,
+                &a.plan,
+                a.paused
+            ),
+            (
+                &custom.identifier,
+                &custom.models,
+                3,
+                &custom.upstream,
+                &custom.plan,
+                true
+            )
+        );
+
+        // Updating an account that doesn't exist fails for that op only.
+        b.command(Command::UpdateAccount {
+            op: 9,
+            id: "nope".into(),
+            edit: Box::new(edit),
+        });
+        let out = drain(&mut rx);
+        assert!(out.iter().any(|u| failed(u, 9)));
+        assert!(!out.iter().any(|u| saved(u, 9) || setup_for(u, 9)));
+
+        // A failing add (duplicate id) replies Failed and sends no setup.
+        b.command(Command::AddAccount {
+            op: 10,
+            account: Box::new(observed("anthropic-dev", "Dupe")),
+        });
+        let out = drain(&mut rx);
+        assert!(out.iter().any(|u| failed(u, 10)));
+        assert!(!out.iter().any(|u| saved(u, 10) || setup_for(u, 10)));
+        assert_eq!(on_disk(dir.path()).accounts.len(), 1);
+    }
+
+    /// Regression (review r2 P3): an invalid edit is reported with the
+    /// original reason, and the canonical (unchanged) config is republished
+    /// so the UI shows what is actually saved.
+    #[test]
+    fn failed_edits_republish_the_saved_value_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut b, mut rx) = test_bridge(dir.path());
+        let saved_skip = on_disk(dir.path()).routing.skip_below_pct;
+        b.command(Command::Edit(ConfigEdit::SkipBelowPct(150.0)));
+        let out = drain(&mut rx);
+        let rolled_back = out
+            .iter()
+            .any(|u| matches!(u, Update::Config(c) if c.routing.skip_below_pct == saved_skip));
+        assert!(rolled_back, "canonical config republished");
+        assert!(out.iter().any(
+            |u| matches!(u, Update::Error(Scope::Routing, m) if m.contains("skip_below_pct"))
+        ));
+        assert_eq!(on_disk(dir.path()).routing.skip_below_pct, saved_skip);
     }
 
     #[test]

@@ -119,7 +119,11 @@ pub fn handle(action: TrayAction, cx: &mut App) {
             let store = cx.global::<Shell>().store.clone();
             // The bridge drains in-flight requests (≤10 s), then replies
             // `Stopped`, which quits. The fallback covers a dead bridge.
-            store.read(cx).send(crate::store::Command::Quit);
+            if store.read(cx).send(crate::store::Command::Quit).is_err() {
+                // No runtime to drain: quit now.
+                cx.quit();
+                return;
+            }
             cx.spawn(async |cx| {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(12))
@@ -279,14 +283,17 @@ pub fn keep_times_fresh<T: 'static>(
     cx: &mut gpui::Context<T>,
 ) -> gpui::Task<()> {
     let store = store.clone();
-    store.read(cx).send(crate::store::Command::Republish);
+    // Best effort: a missing runtime is already reported elsewhere.
+    let _ = store.read(cx).send(crate::store::Command::Republish);
     cx.spawn(async move |_, cx| {
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(30))
                 .await;
             // Dropping the owning view drops this task, ending the loop.
-            cx.update(|cx| store.read(cx).send(crate::store::Command::Republish));
+            cx.update(|cx| {
+                let _ = store.read(cx).send(crate::store::Command::Republish);
+            });
         }
     })
 }

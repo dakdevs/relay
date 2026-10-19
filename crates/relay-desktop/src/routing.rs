@@ -11,7 +11,7 @@ use crate::{
     assets::Mark,
     input::TextInput,
     login,
-    store::Store,
+    store::{ConfigEdit, Scope, Store},
     theme::Theme,
     widgets::{self, Tone, caps, ui},
 };
@@ -128,11 +128,8 @@ fn port_editor(store: &Entity<Store>, window: &mut Window, cx: &mut App) -> AnyE
                 let text = field.read(cx).content.to_string();
                 st.update(cx, |s, cx| {
                     match parse_port(&text) {
-                        Ok(port) => {
-                            s.error = None;
-                            s.edit_config(|c| c.server.listen.set_port(port));
-                        }
-                        Err(e) => s.error = Some(e),
+                        Ok(port) => s.edit(ConfigEdit::ListenPort(port)),
+                        Err(e) => s.set_error(Scope::Routing, e),
                     }
                     cx.notify();
                 });
@@ -169,7 +166,7 @@ pub fn view(store: &Entity<Store>, window: &mut Window, cx: &mut App) -> AnyElem
         96.,
         move |i, _, cx| {
             st.update(cx, |s, cx| {
-                s.edit_config(|c| c.routing.strategy = STRATEGIES[i].0);
+                s.edit(ConfigEdit::Strategy(STRATEGIES[i].0));
                 cx.notify();
             })
         },
@@ -183,7 +180,7 @@ pub fn view(store: &Entity<Store>, window: &mut Window, cx: &mut App) -> AnyElem
         r.sticky,
         move |on, _, cx| {
             st.update(cx, |s, cx| {
-                s.edit_config(|c| c.routing.sticky = on);
+                s.edit(ConfigEdit::Sticky(on));
                 cx.notify();
             })
         },
@@ -205,18 +202,17 @@ pub fn view(store: &Entity<Store>, window: &mut Window, cx: &mut App) -> AnyElem
         .focus_visible(|s| s.bg(t.focus))
         .on_click(move |_, _, cx| {
             st.update(cx, |s, cx| {
-                s.edit_config(|c| c.routing.skip_below_pct = next_skip(c.routing.skip_below_pct));
+                let next = next_skip(s.config.routing.skip_below_pct);
+                s.edit(ConfigEdit::SkipBelowPct(next));
                 cx.notify();
             })
         })
         .into_any_element();
-    let idle = widgets::switch(
+    let idle = widgets::switch_disabled(
         "idle-poll",
-        "Poll quota while idle (unavailable)",
-        false,
-        |_, _, _| {},
-        window,
-        cx,
+        "Poll quota while idle",
+        "Unavailable: no documented, non-billed quota read exists for subscriptions",
+        &t,
     );
     let login_path = login::current();
     let login_on = login_path.as_deref().is_some_and(login::is_enabled);
@@ -233,7 +229,10 @@ pub fn view(store: &Entity<Store>, window: &mut Window, cx: &mut App) -> AnyElem
                 _ => Err("Cannot find the login items folder".into()),
             };
             st.update(cx, |s, cx| {
-                s.error = result.err();
+                match result {
+                    Ok(()) => s.clear_error(Scope::Login),
+                    Err(e) => s.set_error(Scope::Login, format!("Open at login: {e}")),
+                }
                 cx.notify();
             });
         },
@@ -269,7 +268,7 @@ pub fn view(store: &Entity<Store>, window: &mut Window, cx: &mut App) -> AnyElem
                 .child(setting(
                     "Poll quota while idle",
                     Some("Off: values update only when requests pass through. No documented, non-billed quota read exists for subscriptions.".into()),
-                    div().opacity(0.5).child(idle).into_any_element(),
+                    idle,
                     &t,
                 )),
         )
@@ -353,12 +352,16 @@ pub fn view(store: &Entity<Store>, window: &mut Window, cx: &mut App) -> AnyElem
             "Statuses describe what this build does, not legal advice. Observed groups always follow their T3 instance.",
         ));
 
-    let error = store.read(cx).error.clone();
+    // Routing and login failures are kept apart so one never clears the other.
+    let errors: Vec<String> = [Scope::Routing, Scope::Login]
+        .into_iter()
+        .filter_map(|sc| store.read(cx).error(sc).map(str::to_owned))
+        .collect();
     div()
         .flex()
         .flex_col()
         .gap(px(12.))
-        .children(error.map(|e| {
+        .children(errors.into_iter().map(|e| {
             div()
                 .text_size(px(13.))
                 .text_color(t.ember)

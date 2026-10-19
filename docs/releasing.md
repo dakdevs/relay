@@ -35,7 +35,7 @@ scripts/version.sh check            # CI: file, Cargo.toml and (with --tag) tag 
 3. Tag and push: `git tag "v$v" && git push origin main "v$v"`.
 4. The **Release** workflow runs on the tag:
    - `verify`: `scripts/version.sh check --tag`, then `scripts/test.sh`.
-   - `build` (all four must pass; fail-fast):
+   - `build` (all four must pass; each runs to completion even if another fails):
 
      | Target                      | Runner             |
      | --------------------------- | ------------------ |

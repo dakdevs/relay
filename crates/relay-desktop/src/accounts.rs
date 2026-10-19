@@ -20,7 +20,7 @@ use crate::{
     format,
     input::TextInput,
     model::{Account, ModeTag, State},
-    store::{Command, Store},
+    store::{AccountEdit, Command, ConnectEvent, Op, Scope, Store},
     theme::{Theme, radius},
     widgets::{self, Button, ButtonKind, Tone, caps, ui},
 };
@@ -111,15 +111,25 @@ pub fn view(
         .child(
             div()
                 .flex()
-                .items_baseline()
+                .items_center()
                 .gap(px(8.))
                 .child(div().text_size(px(19.)).font_weight(FontWeight::SEMIBOLD).child("Accounts"))
                 .child(div().text_size(px(13.)).text_color(t.muted).child(format!(
                     "{} accounts · {} providers",
                     overview.account_count(),
                     providers
-                ))),
+                )))
+                .child(div().flex_1())
+                .child({
+                    let dashboard = dashboard.clone();
+                    Button::new("connect", ButtonKind::Primary, "Connect an account")
+                        .label("Connect…")
+                        .on_click(move |_, window, cx| dashboard.update(cx, |d, cx| d.open_connect(window, cx)))
+                }),
         )
+        .children(store.read(cx).error(Scope::Accounts).map(|e| {
+            div().text_size(px(13.)).text_color(t.ember).child(e.to_string())
+        }))
         .children(overview.sections.iter().map(|sec| {
             widgets::surface(&t)
                 .px(px(16.))
@@ -163,7 +173,7 @@ pub fn view(
                                 .child(div().text_size(px(13.)).text_color(t.muted).child(g.count_label.clone()))
                                 .child(widgets::tag(g.mode.text(), if g.mode == ModeTag::Observed { Tone::Neutral } else { Tone::Green }, &t)),
                         )
-                        .children(g.accounts.iter().enumerate().map(|(i, a)| row(a, i % 2 == 0, now, store, &t)))
+                        .children(g.accounts.iter().enumerate().map(|(i, a)| row(a, i % 2 == 0, now, store, &dashboard, &t)))
                 }))
         }))
         .child(div().text_size(px(12.)).text_color(t.muted).child(
@@ -172,28 +182,63 @@ pub fn view(
         .into_any_element()
 }
 
-fn row(a: &Account, tinted: bool, now: i64, store: &Entity<Store>, t: &Theme) -> AnyElement {
+/// The one action a row offers. Fixing actions (Resume, Reconnect) are
+/// raised buttons as on board 4; Pause is a quiet, reversible extra.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowAction {
+    Resume,
+    Reconnect,
+    Pause,
+}
+
+pub fn row_action(state: State) -> RowAction {
+    match state {
+        State::Paused => RowAction::Resume,
+        State::Disconnected => RowAction::Reconnect,
+        _ => RowAction::Pause,
+    }
+}
+
+fn row(
+    a: &Account,
+    tinted: bool,
+    now: i64,
+    store: &Entity<Store>,
+    dashboard: &Entity<Dashboard>,
+    t: &Theme,
+) -> AnyElement {
     let (text, color) = detail(a, now, t);
-    let action: Option<(&'static str, Command)> = match a.state {
-        State::Paused => Some((
-            "Resume",
-            Command::SetAccountPaused {
-                id: a.id.clone(),
-                paused: false,
-            },
-        )),
-        State::Disconnected => Some(("Reconnect", Command::ClientSetup(a.id.clone()))),
-        // Reversible: a paused account gets no new router-owned sessions;
-        // observed clients keep passing through.
-        _ => Some((
-            "Pause",
-            Command::SetAccountPaused {
-                id: a.id.clone(),
-                paused: true,
-            },
-        )),
-    };
     let store = store.clone();
+    let dashboard = dashboard.clone();
+    let account = a.clone();
+    let action = row_action(a.state);
+    let (label, kind) = match action {
+        RowAction::Resume => ("Resume", ButtonKind::Secondary),
+        RowAction::Reconnect => ("Reconnect", ButtonKind::Secondary),
+        RowAction::Pause => ("Pause", ButtonKind::Quiet),
+    };
+    let button = Button::new(
+        ElementId::Name(format!("fix-{}", a.id).into()),
+        kind,
+        format!("{label} {}", a.label),
+    )
+    .label(label)
+    .on_click(move |_, window, cx| match action {
+        RowAction::Reconnect => {
+            dashboard.update(cx, |d, cx| d.open_reconnect(&account, window, cx))
+        }
+        RowAction::Resume | RowAction::Pause => store.update(cx, |s, cx| {
+            s.clear_error(Scope::Accounts);
+            s.send_or_report(
+                Command::SetAccountPaused {
+                    id: account.id.clone(),
+                    paused: action == RowAction::Pause,
+                },
+                Scope::Accounts,
+            );
+            cx.notify();
+        }),
+    });
     div()
         .id(ElementId::Name(SharedString::from(format!(
             "acct-{}",
@@ -240,15 +285,7 @@ fn row(a: &Account, tinted: bool, now: i64, store: &Entity<Store>, t: &Theme) ->
                 .text_color(color)
                 .child(text),
         )
-        .children(action.map(|(label, command)| {
-            Button::new(
-                ElementId::Name(format!("fix-{}", a.id).into()),
-                ButtonKind::Secondary,
-                label,
-            )
-            .label(label)
-            .on_click(move |_, _, cx| store.read(cx).send(command.clone()))
-        }))
+        .child(button)
         .into_any_element()
 }
 
@@ -287,6 +324,105 @@ pub enum Choice {
     Key,
 }
 
+/// The connect sheet's state machine, free of UI so its handling of
+/// asynchronous replies can be tested deterministically. Replies carry the
+/// op of the request they answer; anything else is ignored.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConnectFlow {
+    pub step: u8,
+    /// The account this sheet saved (or is reconnecting). Once set, the
+    /// provider is locked and Continue merges edits onto that account.
+    pub saved_id: Option<String>,
+    /// Save request awaiting `Saved` or `Failed`.
+    pub save_op: Option<Op>,
+    /// Setup request whose values step 2 shows.
+    pub setup_op: Option<Op>,
+    /// Step 1 error: validation, or the failed save's reason.
+    pub error: Option<String>,
+    /// Step 2 error: the setup request's failure.
+    pub setup_error: Option<String>,
+    /// Reconnect opens on step 2 with no Back: it is not an edit flow.
+    pub reconnect: bool,
+    /// `last_seen` when the sheet opened; only a newer request counts.
+    pub seen_baseline: Option<i64>,
+}
+
+impl ConnectFlow {
+    pub fn fresh() -> Self {
+        Self {
+            step: 1,
+            ..Self::default()
+        }
+    }
+
+    pub fn reconnecting(id: String, setup_op: Op, seen_baseline: Option<i64>) -> Self {
+        Self {
+            step: 2,
+            saved_id: Some(id),
+            setup_op: Some(setup_op),
+            reconnect: true,
+            seen_baseline,
+            ..Self::default()
+        }
+    }
+
+    pub fn provider_locked(&self) -> bool {
+        self.saved_id.is_some()
+    }
+
+    pub fn saving(&self) -> bool {
+        self.save_op.is_some()
+    }
+
+    pub fn submitted(&mut self, op: Op) {
+        self.save_op = Some(op);
+        self.error = None;
+    }
+
+    pub fn send_failed(&mut self, reason: String) {
+        self.save_op = None;
+        self.error = Some(reason);
+    }
+
+    pub fn back(&mut self) {
+        if !self.reconnect {
+            self.step = 1;
+            // Replies to the abandoned setup request are now stale.
+            self.setup_op = None;
+            self.setup_error = None;
+        }
+    }
+
+    pub fn on_event(&mut self, event: &ConnectEvent) {
+        match event {
+            ConnectEvent::Saved { op, id } if self.save_op == Some(*op) => {
+                self.saved_id = Some(id.clone());
+                self.save_op = None;
+                self.setup_op = Some(*op);
+                self.setup_error = None;
+                self.step = 2;
+            }
+            ConnectEvent::Failed { op, message } if self.save_op == Some(*op) => {
+                self.save_op = None;
+                self.error = Some(message.clone());
+            }
+            ConnectEvent::Failed { op, message } if self.setup_op == Some(*op) => {
+                self.setup_error = Some(message.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// True once a request newer than the sheet's opening has arrived.
+    pub fn first_request_seen(&self, seen_at: Option<i64>) -> bool {
+        match (seen_at, self.seen_baseline) {
+            (Some(now), Some(base)) => now > base,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+}
+
 pub struct ConnectSheet {
     store: Entity<Store>,
     focus: FocusHandle,
@@ -295,9 +431,8 @@ pub struct ConnectSheet {
     label: Entity<TextInput>,
     identifier: Entity<TextInput>,
     credential: Entity<TextInput>,
-    step: u8,
-    account_id: Option<String>,
-    error: Option<String>,
+    flow: ConnectFlow,
+    _observe: gpui::Subscription,
 }
 
 impl EventEmitter<Dismiss> for ConnectSheet {}
@@ -308,8 +443,60 @@ impl Focusable for ConnectSheet {
     }
 }
 
-/// Builds the account config from the sheet's fields. The identifier is
-/// masked before it is stored; secrets are only referenced.
+/// Mode and credential reference for a choice. Secrets are referenced by
+/// file path or environment variable name, never stored.
+pub fn credential_for(
+    provider: Provider,
+    choice: Choice,
+    credential: &str,
+) -> Result<(AccountMode, Option<SecretRef>, Option<CredentialKind>), String> {
+    let credential = credential.trim();
+    match choice {
+        Choice::Observe => Ok((AccountMode::Observed, None, None)),
+        Choice::Pool => {
+            if credential.is_empty() {
+                return Err("Pooling needs the path to this account's own login file.".into());
+            }
+            let format = match provider {
+                Provider::Anthropic => SecretFormat::ClaudeCredentialsJson,
+                Provider::Openai => SecretFormat::CodexAuthJson,
+            };
+            Ok((
+                AccountMode::Pooled,
+                Some(SecretRef::File {
+                    file: credential.into(),
+                    format,
+                }),
+                None,
+            ))
+        }
+        Choice::Key => {
+            let var = credential.trim_start_matches('$');
+            if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err("Enter the name of the environment variable that holds the key, e.g. ANTHROPIC_API_KEY.".into());
+            }
+            Ok((
+                AccountMode::Key,
+                Some(SecretRef::Env {
+                    env: var.to_string(),
+                }),
+                Some(CredentialKind::ApiKey),
+            ))
+        }
+    }
+}
+
+/// The text the credential field shows for a saved reference.
+pub fn credential_text(credential: Option<&SecretRef>) -> String {
+    match credential {
+        Some(SecretRef::File { file, .. }) => file.display().to_string(),
+        Some(SecretRef::Env { env }) => env.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Builds a new account from the sheet's fields. The identifier is masked
+/// before it is stored; secrets are only referenced.
 pub fn account_config(
     provider: Provider,
     choice: Choice,
@@ -341,38 +528,7 @@ pub fn account_config(
         id = format!("{base}-{n}");
         n += 1;
     }
-    let credential = credential.trim();
-    let (mode, secret) = match choice {
-        Choice::Observe => (AccountMode::Observed, None),
-        Choice::Pool => {
-            if credential.is_empty() {
-                return Err("Pooling needs the path to this account's own login file.".into());
-            }
-            let format = match provider {
-                Provider::Anthropic => SecretFormat::ClaudeCredentialsJson,
-                Provider::Openai => SecretFormat::CodexAuthJson,
-            };
-            (
-                AccountMode::Pooled,
-                Some(SecretRef::File {
-                    file: credential.into(),
-                    format,
-                }),
-            )
-        }
-        Choice::Key => {
-            let var = credential.trim_start_matches('$');
-            if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return Err("Enter the name of the environment variable that holds the key, e.g. ANTHROPIC_API_KEY.".into());
-            }
-            (
-                AccountMode::Key,
-                Some(SecretRef::Env {
-                    env: var.to_string(),
-                }),
-            )
-        }
-    };
+    let (mode, credential, credential_kind) = credential_for(provider, choice, credential)?;
     let identifier = identifier.trim();
     Ok(AccountConfig {
         id: AccountId(id),
@@ -381,12 +537,36 @@ pub fn account_config(
         mode,
         plan: None,
         identifier: (!identifier.is_empty()).then(|| mask_identifier(identifier)),
-        credential_kind: (choice == Choice::Key).then_some(CredentialKind::ApiKey),
+        credential_kind,
         upstream: None,
-        credential: secret,
+        credential,
         paused: false,
         max_in_flight: 8,
         models: Vec::new(),
+    })
+}
+
+/// The editable fields from the sheet, to merge onto a saved account. An
+/// empty identifier field keeps the saved (masked) identifier.
+pub fn account_edit(
+    provider: Provider,
+    choice: Choice,
+    label: &str,
+    identifier: &str,
+    credential: &str,
+) -> Result<AccountEdit, String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("Give the account a label, such as Personal or Work.".into());
+    }
+    let (mode, credential, credential_kind) = credential_for(provider, choice, credential)?;
+    let identifier = identifier.trim();
+    Ok(AccountEdit {
+        label: label.to_string(),
+        identifier: (!identifier.is_empty()).then(|| mask_identifier(identifier)),
+        mode,
+        credential,
+        credential_kind,
     })
 }
 
@@ -397,7 +577,13 @@ impl ConnectSheet {
         let label = cx.new(|cx| TextInput::new("Personal", cx));
         let identifier = cx.new(|cx| TextInput::new("you@example.com (masked when saved)", cx));
         let credential = cx.new(|cx| TextInput::new("", cx));
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        let observe = cx.observe(&store, |this, store, cx| {
+            let events = store.read(cx).connect_events.clone();
+            for e in &events {
+                this.flow.on_event(e);
+            }
+            cx.notify();
+        });
         Self {
             store,
             focus,
@@ -406,10 +592,55 @@ impl ConnectSheet {
             label,
             identifier,
             credential,
-            step: 1,
-            account_id: None,
-            error: None,
+            flow: ConnectFlow::fresh(),
+            _observe: observe,
         }
+    }
+
+    /// Reconnect: step 2 for an existing account, showing its setup values
+    /// and waiting for a request newer than now. There is no Back.
+    pub fn reconnect(
+        store: Entity<Store>,
+        account: &Account,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut sheet = Self::new(store, window, cx);
+        sheet.provider = account.provider;
+        sheet.choice = match account.mode {
+            ModeTag::Observed => Choice::Observe,
+            ModeTag::Key => Choice::Key,
+            ModeTag::Pooled | ModeTag::Mixed => Choice::Pool,
+        };
+        sheet
+            .label
+            .update(cx, |l, cx| l.set_text(account.label.clone(), cx));
+        let saved_ref = sheet
+            .store
+            .read(cx)
+            .config
+            .account(&account.id)
+            .map(|a| credential_text(a.credential.as_ref()))
+            .unwrap_or_default();
+        sheet
+            .credential
+            .update(cx, |c, cx| c.set_text(saved_ref, cx));
+        let id = account.id.clone();
+        let seen = account.seen_at;
+        let sent = sheet.store.update(cx, |s, _| {
+            let op = s.next_op();
+            s.send(Command::ClientSetup { op, id: id.clone() })
+                .map(|()| op)
+        });
+        sheet.flow = match sent {
+            Ok(op) => ConnectFlow::reconnecting(id, op, seen),
+            Err(e) => {
+                let mut f = ConnectFlow::reconnecting(id, 0, seen);
+                f.setup_error = Some(e);
+                f
+            }
+        };
+        sheet
     }
 
     fn credential_hint(&self) -> (&'static str, &'static str) {
@@ -433,30 +664,59 @@ impl ConnectSheet {
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
+        if self.flow.saving() {
+            return;
+        }
         let read = |e: &Entity<TextInput>, cx: &Context<Self>| e.read(cx).content.to_string();
-        let existing = self.store.read(cx).config.accounts.clone();
-        match account_config(
-            self.provider,
-            self.choice,
-            &read(&self.label, cx),
-            &read(&self.identifier, cx),
-            &read(&self.credential, cx),
-            &existing,
-        ) {
-            Ok(account) => {
-                let id = account.id.0.clone();
-                self.store.update(cx, |s, cx| {
-                    s.error = None;
-                    s.setup = None;
-                    s.send(Command::AddAccount(Box::new(account)));
-                    s.send(Command::ClientSetup(id.clone()));
-                    cx.notify();
-                });
-                self.account_id = Some(id);
-                self.error = None;
-                self.step = 2;
+        let (label, identifier, credential) = (
+            read(&self.label, cx),
+            read(&self.identifier, cx),
+            read(&self.credential, cx),
+        );
+        let saved_id = self.flow.saved_id.clone();
+        let (provider, choice) = (self.provider, self.choice);
+        let built: Result<Box<dyn FnOnce(Op) -> Command>, String> = match &saved_id {
+            // After Back: merge the editable fields onto the saved account.
+            Some(id) => {
+                account_edit(provider, choice, &label, &identifier, &credential).map(|edit| {
+                    let id = id.clone();
+                    Box::new(move |op| Command::UpdateAccount {
+                        op,
+                        id,
+                        edit: Box::new(edit),
+                    }) as Box<dyn FnOnce(Op) -> Command>
+                })
             }
-            Err(e) => self.error = Some(e),
+            None => {
+                let existing = self.store.read(cx).config.accounts.clone();
+                account_config(
+                    provider,
+                    choice,
+                    &label,
+                    &identifier,
+                    &credential,
+                    &existing,
+                )
+                .map(|account| {
+                    Box::new(move |op| Command::AddAccount {
+                        op,
+                        account: Box::new(account),
+                    }) as Box<dyn FnOnce(Op) -> Command>
+                })
+            }
+        };
+        match built {
+            Ok(make) => {
+                let sent = self.store.update(cx, |s, _| {
+                    let op = s.next_op();
+                    s.send(make(op)).map(|()| op)
+                });
+                match sent {
+                    Ok(op) => self.flow.submitted(op),
+                    Err(e) => self.flow.send_failed(e),
+                }
+            }
+            Err(e) => self.flow.error = Some(e),
         }
         cx.notify();
     }
@@ -551,7 +811,7 @@ fn field(label: &'static str, input: &Entity<TextInput>, t: &Theme) -> impl Into
 impl Render for ConnectSheet {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = ui(cx).theme;
-        let body = if self.step == 1 {
+        let body = if self.flow.step == 1 {
             self.step_one(cx)
         } else {
             self.step_two(cx)
@@ -596,6 +856,9 @@ impl ConnectSheet {
     fn step_one(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = ui(cx).theme;
         let entity = cx.entity();
+        // The provider is part of a saved account's identity: once saved,
+        // the picker shows the choice but can't change it.
+        let locked = self.flow.provider_locked();
         let provider_card = |p: Provider, sel: bool, entity: Entity<Self>| {
             div()
                 .id(ElementId::Name(format!("pick-{}", p.key()).into()))
@@ -606,8 +869,11 @@ impl ConnectSheet {
                 } else {
                     gpui::Toggled::False
                 })
-                .focusable()
-                .tab_stop(true)
+                .when(locked, |d| {
+                    d.aria_description("Saved account: provider can't change")
+                        .opacity(if sel { 1.0 } else { 0.45 })
+                })
+                .when(!locked, |d| d.focusable().tab_stop(true).cursor_pointer())
                 .flex_1()
                 .flex()
                 .items_center()
@@ -618,11 +884,12 @@ impl ConnectSheet {
                 .bg(if sel { t.focus } else { t.inset })
                 .hover(|s| s.bg(if sel { t.focus } else { t.hover }))
                 .focus_visible(|s| s.bg(t.focus))
-                .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     entity.update(cx, |this, cx| {
-                        this.provider = p;
-                        cx.notify();
+                        if !this.flow.provider_locked() {
+                            this.provider = p;
+                            cx.notify();
+                        }
                     })
                 })
                 .child(widgets::mark(provider_mark(p), 18., &t))
@@ -726,12 +993,21 @@ impl ConnectSheet {
                             .child(field("Identifier shown as", &self.identifier, &t)),
                     )
                     .when(self.choice != Choice::Observe, |d| d.child(field(cred_label, &self.credential, &t)))
-                    .children(self.error.clone().map(|e| div().text_size(px(13.)).text_color(t.ember).child(e))),
+                    .children(
+                        self.flow
+                            .error
+                            .clone()
+                            .map(|e| div().text_size(px(13.)).text_color(t.ember).child(e)),
+                    ),
             )
             .child(self.footer(
                 vec![
                     Button::new("connect-cancel", ButtonKind::Secondary, "Cancel").label("Cancel").on_click(cancel).into_any_element(),
-                    Button::new("connect-continue", ButtonKind::Primary, "Continue").label("Continue").on_click(submit).into_any_element(),
+                    Button::new("connect-continue", ButtonKind::Primary, "Continue")
+                        .label(if self.flow.saving() { "Saving…" } else { "Continue" })
+                        .disabled(self.flow.saving())
+                        .on_click(submit)
+                        .into_any_element(),
                 ],
                 &t,
             ))
@@ -741,14 +1017,19 @@ impl ConnectSheet {
     fn step_two(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = ui(cx).theme;
         let store = self.store.read(cx);
-        let id = self.account_id.clone().unwrap_or_default();
+        let id = self.flow.saved_id.clone().unwrap_or_default();
         let listening = matches!(
             store.overview.status,
             crate::model::Status::Running | crate::model::Status::Paused
         );
         let address = store.overview.address.clone();
-        let setup = store.setup.clone().filter(|s| s.account_id == id);
-        let error = store.error.clone();
+        let setup = self.flow.setup_op.and_then(|op| {
+            store.connect_event(op).find_map(|e| match e {
+                ConnectEvent::Setup { setup, .. } => Some(setup.clone()),
+                _ => None,
+            })
+        });
+        let error = self.flow.setup_error.clone();
         let seen = store
             .overview
             .sections
@@ -756,7 +1037,7 @@ impl ConnectSheet {
             .flat_map(|s| &s.groups)
             .flat_map(|g| &g.accounts)
             .find(|a| a.id == id)
-            .is_some_and(|a| a.seen_at.is_some());
+            .is_some_and(|a| self.flow.first_request_seen(a.seen_at));
         let label = self.label.read(cx).content.to_string();
         let mode = match self.choice {
             Choice::Observe => "Observe",
@@ -809,9 +1090,10 @@ impl ConnectSheet {
         };
         let copy_text = setup.as_ref().map(|s| s.lines.join("\n"));
         let back = cx.listener(|this, _, _, cx| {
-            this.step = 1;
+            this.flow.back();
             cx.notify();
         });
+        let reconnect = self.flow.reconnect;
         let done = cx.listener(|_, _, _, cx| cx.emit(Dismiss));
         div()
             .flex()
@@ -870,9 +1152,12 @@ impl ConnectSheet {
                     }),
             )
             .child(self.footer(
-                vec![
-                    Button::new("connect-back", ButtonKind::Secondary, "Back").label("Back").on_click(back).into_any_element(),
-                    Button::new("connect-copy", ButtonKind::Secondary, "Copy setup values")
+                [
+                    // Reconnect isn't an edit flow, so it has no Back.
+                    (!reconnect).then(|| {
+                        Button::new("connect-back", ButtonKind::Secondary, "Back").label("Back").on_click(back).into_any_element()
+                    }),
+                    Some(Button::new("connect-copy", ButtonKind::Secondary, "Copy setup values")
                         .label("Copy values")
                         .icon("icons/copy.svg")
                         .disabled(copy_text.is_none())
@@ -881,9 +1166,12 @@ impl ConnectSheet {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                             }
                         })
-                        .into_any_element(),
-                    Button::new("connect-done", ButtonKind::Primary, "Done").label("Done").on_click(done).into_any_element(),
-                ],
+                        .into_any_element()),
+                    Some(Button::new("connect-done", ButtonKind::Primary, "Done").label("Done").on_click(done).into_any_element()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
                 &t,
             ))
             .into_any_element()
@@ -893,6 +1181,133 @@ impl ConnectSheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_take_only_sheet_fields_and_keep_the_identifier_when_blank() {
+        let e = account_edit(
+            Provider::Openai,
+            Choice::Key,
+            " Dev laptop ",
+            "",
+            "$OPENAI_API_KEY",
+        )
+        .unwrap();
+        assert_eq!(e.label, "Dev laptop");
+        assert_eq!(
+            e.identifier, None,
+            "blank keeps the saved masked identifier"
+        );
+        assert_eq!(
+            e.credential,
+            Some(SecretRef::Env {
+                env: "OPENAI_API_KEY".into()
+            })
+        );
+        let e = account_edit(Provider::Openai, Choice::Observe, "Dev", "dak@acme.co", "").unwrap();
+        assert_eq!(e.identifier.as_deref(), Some("d••@acme.co"));
+        assert!(account_edit(Provider::Openai, Choice::Observe, " ", "", "").is_err());
+    }
+
+    #[test]
+    fn saved_references_refill_the_credential_field() {
+        assert_eq!(
+            credential_text(Some(&SecretRef::Env {
+                env: "ANTHROPIC_API_KEY".into()
+            })),
+            "ANTHROPIC_API_KEY"
+        );
+        let file = SecretRef::File {
+            file: "/home/me/.claude/.credentials.json".into(),
+            format: SecretFormat::ClaudeCredentialsJson,
+        };
+        assert_eq!(
+            credential_text(Some(&file)),
+            "/home/me/.claude/.credentials.json"
+        );
+        assert_eq!(credential_text(None), "");
+    }
+
+    fn saved(op: Op, id: &str) -> ConnectEvent {
+        ConnectEvent::Saved { op, id: id.into() }
+    }
+
+    fn failed(op: Op) -> ConnectEvent {
+        ConnectEvent::Failed {
+            op,
+            message: format!("op {op} failed"),
+        }
+    }
+
+    /// Back → Continue → late replies to the first round, in every order:
+    /// only the current request's replies move the sheet.
+    #[test]
+    fn flow_ignores_stale_replies_in_any_order() {
+        let mut f = ConnectFlow::fresh();
+        f.submitted(1);
+        assert!(f.saving());
+        f.on_event(&saved(1, "openai-dev"));
+        assert_eq!(
+            (f.step, f.setup_op, f.saved_id.as_deref()),
+            (2, Some(1), Some("openai-dev"))
+        );
+        assert!(f.provider_locked());
+
+        f.back();
+        assert_eq!((f.step, f.setup_op), (1, None));
+        f.submitted(2);
+        // A late setup failure for op 1 must not cancel the save of op 2.
+        f.on_event(&failed(1));
+        assert!(f.saving());
+        assert_eq!(f.error, None);
+        // A duplicate Saved for op 1 must not advance.
+        f.on_event(&saved(1, "openai-dev"));
+        assert_eq!(f.step, 1);
+        f.on_event(&saved(2, "openai-dev"));
+        assert_eq!((f.step, f.setup_op), (2, Some(2)));
+        // Re-processing the whole event log is harmless.
+        for e in [saved(1, "openai-dev"), failed(1), saved(2, "openai-dev")] {
+            f.on_event(&e);
+        }
+        assert_eq!(
+            (f.step, f.setup_op, f.setup_error.as_deref()),
+            (2, Some(2), None)
+        );
+        // The current setup request failing shows on step 2.
+        f.on_event(&failed(2));
+        assert_eq!(f.setup_error.as_deref(), Some("op 2 failed"));
+    }
+
+    #[test]
+    fn failed_save_or_send_returns_to_editable_step_one() {
+        let mut f = ConnectFlow::fresh();
+        f.submitted(5);
+        f.on_event(&failed(5));
+        assert_eq!(
+            (f.step, f.saving(), f.error.as_deref()),
+            (1, false, Some("op 5 failed"))
+        );
+        assert!(!f.provider_locked(), "nothing saved yet");
+        f.send_failed("runtime gone".into());
+        assert_eq!(
+            (f.saving(), f.error.as_deref()),
+            (false, Some("runtime gone"))
+        );
+    }
+
+    #[test]
+    fn reconnect_has_no_back_and_counts_only_newer_requests() {
+        let mut f = ConnectFlow::reconnecting("openai-dev".into(), 9, Some(1_000));
+        f.back();
+        assert_eq!(f.step, 2, "no Back on Reconnect");
+        assert!(f.provider_locked());
+        assert!(
+            !f.first_request_seen(Some(1_000)),
+            "the old request doesn't count"
+        );
+        assert!(f.first_request_seen(Some(1_001)));
+        assert!(!f.first_request_seen(None));
+        assert!(ConnectFlow::fresh().first_request_seen(Some(1)));
+    }
 
     #[test]
     fn observe_account_has_no_credential_and_masked_identifier() {
