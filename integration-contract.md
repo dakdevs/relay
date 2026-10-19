@@ -140,11 +140,16 @@ their own, so Relay does not guarantee at-most-once execution.
 ## Credential recovery and restarts
 
 - A pooled or key account whose credential is missing, expired or rejected
-  (401) is re-read at most every 2 s while requests need it, and at once when
-  its file changes; a healthy file credential is checked for changes every
-  30 s. A rejected token stays out until the source holds a different one.
-  Relay never refreshes logins itself. A 403 is a permission or model denial
-  and does not disconnect the account unless the body says
+  (401) is re-read at most every 2 s, and a broken file credential is checked
+  for changes at most every 250 ms; a healthy file credential is checked
+  every 30 s. Each check is claimed by one caller (compare-and-swap) and runs
+  on the blocking pool, never as I/O on the request path. A session bound to
+  an account refreshes that account's own login rather than moving.
+- A 401 is attributed to the token actually sent. Only that token is marked
+  rejected; a token another request already renewed is kept. Each account is
+  retried at most once per request after a 401, and only with a different
+  token. Relay never refreshes logins itself. A 403 is a permission or model
+  denial and does not disconnect the account unless the body says
   `authentication_error`.
 - `Handle::restart_required() -> Vec<String>` lists applied settings that only
   take effect after a restart (local address, local key source, upstream

@@ -2,7 +2,7 @@
 
 use crate::body::{BoxError, InFlight, Record, RespBody, TapBody};
 use crate::secrets::key_matches;
-use crate::state::{AccountRt, Registry, Shared, now_ms};
+use crate::state::{AccountRt, Refresh, Registry, Shared, now_ms};
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri};
@@ -330,7 +330,7 @@ async fn pass_through(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
         let permit = acc.sem.clone().try_acquire_owned().ok();
         // Observed traffic is never refused for saturation: the client
         // already chose its account, so the slot count is advisory.
-        match attempt_once(ctx, &acc, attempt, false, permit).await {
+        match attempt_once(ctx, &acc, attempt, false, false, permit).await {
             Attempt::Commit(r) => return r,
             Attempt::Failed {
                 outcome, response, ..
@@ -354,12 +354,38 @@ fn pool_of(ctx: &Ctx) -> Option<Pool> {
     }
 }
 
-/// Re-reads an account's credential source if due (single-flight; the read
-/// runs on the blocking pool). Returns whether the credential is usable.
-async fn refresh(acc: Arc<AccountRt>) -> bool {
+/// Runs a claimed credential refresh on the blocking pool, serialised with
+/// other credential changes for the account. Returns whether the
+/// credential is usable afterwards.
+async fn refresh(acc: Arc<AccountRt>, kind: Refresh) -> bool {
     let _guard = acc.reloading.lock().await;
     let a = acc.clone();
-    tokio::task::spawn_blocking(move || a.refresh_credential_blocking())
+    tokio::task::spawn_blocking(move || a.refresh_blocking(kind))
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether the account's credential can be used now: claims a refresh when
+/// one is due, otherwise waits for any refresh already running.
+async fn credential_ready(acc: &Arc<AccountRt>) -> bool {
+    let now = now_ms();
+    if let Some(kind) = acc.claim_refresh(now) {
+        return refresh(acc.clone(), kind).await;
+    }
+    if !acc.credential_usable(now) {
+        // Another task may be re-reading it right now.
+        drop(acc.reloading.lock().await);
+    }
+    acc.credential_usable(now_ms())
+}
+
+/// Handles a 401 for the credential that was sent, serialised with other
+/// credential changes. Returns true when a different usable credential is
+/// loaded.
+async fn on_unauthorized(acc: &Arc<AccountRt>, sent: Arc<Credential>) -> bool {
+    let _guard = acc.reloading.lock().await;
+    let a = acc.clone();
+    tokio::task::spawn_blocking(move || a.on_unauthorized_blocking(&sent))
         .await
         .unwrap_or(false)
 }
@@ -380,8 +406,11 @@ async fn pick_recovering(
     let due: Vec<_> = ctx
         .reg
         .pool(ctx.provider, pool)
-        .filter(|a| !tried.contains(a.id()) && a.needs_refresh(now))
-        .map(|a| tokio::spawn(refresh(a.clone())))
+        .filter(|a| !tried.contains(a.id()))
+        .filter_map(|a| {
+            a.claim_refresh(now)
+                .map(|k| tokio::spawn(refresh(a.clone(), k)))
+        })
         .collect();
     if let Some(a) = pick(ctx, pool, tried, now) {
         return Some(a);
@@ -467,6 +496,8 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
     let mut attempt: u8 = 0;
     let mut last: Option<Response<RespBody>> = None;
     let mut retry_same: Option<Arc<AccountRt>> = None;
+    // Accounts already retried after a 401 in this request (at most once each).
+    let mut auth_retried: Vec<AccountId> = Vec::new();
     loop {
         let now = now_ms();
         if attempt > 0 && ctx.started.elapsed() > Duration::from_millis(RETRY_BUDGET_MS) {
@@ -497,9 +528,10 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
                         None => break,
                     }
                 }
-                // Continuation state is bound to the account: send it there
-                // and let the provider answer, unless it can't be used at all.
-                Some(b) if !b.cfg.paused && b.credential_ok(now) => b,
+                // Continuation state is bound to the account: keep it there
+                // (its credential is refreshed below if needed) and let the
+                // provider answer, unless the user paused it.
+                Some(b) if !b.cfg.paused => b,
                 Some(_) => {
                     return ctx.err(StatusCode::SERVICE_UNAVAILABLE, "session_account_unavailable", "This session's account is paused or disconnected, and its conversation state cannot move to another account");
                 }
@@ -532,12 +564,7 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
                 }
             }
         };
-        let usable = if acc.needs_refresh(now_ms()) {
-            refresh(acc.clone()).await
-        } else {
-            acc.credential_ok(now_ms())
-        };
-        if !usable {
+        if !credential_ready(&acc).await {
             drop(permit);
             if pinned.is_none() && traits.stateless {
                 // Credential vanished between selection and use; nothing has
@@ -550,7 +577,8 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
                 "The account's credential is unavailable",
             );
         }
-        match attempt_once(ctx, &acc, attempt, true, Some(permit)).await {
+        let may_auth_retry = !auth_retried.contains(acc.id());
+        match attempt_once(ctx, &acc, attempt, true, may_auth_retry, Some(permit)).await {
             Attempt::Commit(r) => {
                 if let Some(s) = &session {
                     ctx.sh.sessions.bind(ctx.provider, s, acc.id());
@@ -564,6 +592,7 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
                 auth_retry,
             } => {
                 if auth_retry {
+                    auth_retried.push(acc.id().clone());
                     retry_same = Some(acc);
                     attempt += 1;
                     continue;
@@ -593,27 +622,6 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
         }
         r
     })
-}
-
-/// After a 401: re-reads the credential source once (single-flight).
-/// Returns true when it now holds a usable token different from `before`,
-/// i.e. the CLI renewed its login and the request may be retried once.
-async fn reload_after_401(acc: &Arc<AccountRt>, before: Option<Arc<Credential>>) -> bool {
-    let _guard = acc.reloading.lock().await;
-    let current = acc.credential.load_full();
-    let differs = |c: &Option<Arc<Credential>>| match (&before, c) {
-        (Some(a), Some(b)) => a.token != b.token,
-        (None, Some(_)) => true,
-        _ => false,
-    };
-    if differs(&current) && acc.credential_ok(now_ms()) {
-        return true;
-    }
-    let a = acc.clone();
-    let ok = tokio::task::spawn_blocking(move || a.load_credential())
-        .await
-        .unwrap_or(false);
-    ok && differs(&acc.credential.load_full())
 }
 
 enum Attempt {
@@ -648,6 +656,7 @@ async fn attempt_once(
     acc: &Arc<AccountRt>,
     attempt: u8,
     owned: bool,
+    may_auth_retry: bool,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Attempt {
     let flight = InFlight::new(ctx.sh.clone(), acc.clone(), permit);
@@ -679,9 +688,15 @@ async fn attempt_once(
     };
     let mut headers = ctx.headers.clone();
     upstream_request(&mut headers);
+    // The exact credential sent, so a late 401 is attributed to it and not
+    // to whatever is current by then.
+    let sent_credential = if owned {
+        acc.credential.load_full()
+    } else {
+        None
+    };
     if owned {
-        let cred = acc.credential.load_full();
-        let injected = cred
+        let injected = sent_credential
             .as_deref()
             .map(|c| auth::inject(acc.cfg.provider, acc.cfg.credential_kind(), &mut headers, c));
         if !matches!(injected, Some(Ok(()))) {
@@ -817,14 +832,14 @@ async fn attempt_once(
             acc.cool_down(retry, now);
             ctx.sh.changed();
         }
-        let auth_retry = owned && outcome == Outcome::AuthError && attempt == 0 && {
-            let before = acc.credential.load_full();
-            reload_after_401(acc, before).await
+        let auth_retry = match (&sent_credential, outcome) {
+            (Some(c), Outcome::AuthError) => {
+                let renewed = on_unauthorized(acc, c.clone()).await;
+                ctx.sh.changed();
+                renewed && may_auth_retry
+            }
+            _ => false,
         };
-        if outcome == Outcome::AuthError && owned && !auth_retry {
-            acc.credential_rejected();
-            ctx.sh.changed();
-        }
         let rec = record(status.as_u16(), streaming);
         let response = Response::from_parts(
             parts,

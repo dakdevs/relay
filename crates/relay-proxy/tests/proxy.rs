@@ -870,6 +870,17 @@ fn write_claude_login(path: &std::path::Path, token: &str, expires_at: i64) {
     .unwrap();
 }
 
+/// Lifetime of the short-lived test login; long enough for a loaded CI host
+/// to start the proxy and serve one request before it expires.
+const EXPIRES_IN_MS: i64 = 3_000;
+
+async fn sleep_until_ms(at: i64) {
+    let left = at - relay_proxy::state::now_ms();
+    if left > 0 {
+        tokio::time::sleep(Duration::from_millis(left as u64)).await;
+    }
+}
+
 const MESSAGES: &str =
     r#"{"model":"claude-sonnet-5-5","messages":[{"role":"user","content":"hi"}]}"#;
 
@@ -879,7 +890,7 @@ async fn expired_login_recovers_when_the_cli_renews_it() {
     let login_dir = tempfile::tempdir().unwrap();
     let login = login_dir.path().join("credentials.json");
     let now = relay_proxy::state::now_ms();
-    write_claude_login(&login, "old-token", now + 1_500);
+    write_claude_login(&login, "old-token", now + EXPIRES_IN_MS);
     let path = login.clone();
     let env = proxy(
         vec![account(
@@ -902,7 +913,7 @@ async fn expired_login_recovers_when_the_cli_renews_it() {
             .status,
         200
     );
-    tokio::time::sleep(Duration::from_millis(1_700)).await;
+    sleep_until_ms(now + EXPIRES_IN_MS + 200).await;
     // Expired: nothing eligible, and no request reaches the provider.
     let r = send_owned(&c, &env, "/v1/messages", &[], MESSAGES).await;
     assert_eq!(r.status, 503);
@@ -1140,4 +1151,182 @@ async fn restart_only_settings_are_reported() {
         env.handle().restart_required(),
         ["Usage recording and retention"]
     );
+}
+
+async fn wait_for(cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !cond() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(cond(), "condition not reached");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_401_for_old_token_does_not_poison_renewed_login() {
+    let unauthorized = || {
+        Act::json(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error"}}"#,
+        )
+    };
+    let up = Mock::start(Act::sse(vec![CLAUDE_SSE])).await;
+    // Both concurrent requests are answered 401 for the old token, one
+    // much later than the other.
+    up.push(Act::Delay(
+        Duration::from_millis(300),
+        Box::new(unauthorized()),
+    ));
+    up.push(Act::Delay(
+        Duration::from_millis(1_200),
+        Box::new(unauthorized()),
+    ));
+    let env = proxy(
+        vec![account(
+            "a",
+            Provider::Anthropic,
+            AccountMode::Pooled,
+            &up.url(),
+        )],
+        |_| {},
+    );
+    let c = client();
+    let first = {
+        let (c, base, key) = (c.clone(), env.base(), env.key.clone());
+        tokio::spawn(async move {
+            send(
+                &c,
+                format!("{base}/v1/messages"),
+                &[("authorization", &format!("Bearer {key}"))],
+                MESSAGES,
+            )
+            .await
+        })
+    };
+    let second = {
+        let (c, base, key) = (c.clone(), env.base(), env.key.clone());
+        tokio::spawn(async move {
+            send(
+                &c,
+                format!("{base}/v1/messages"),
+                &[("authorization", &format!("Bearer {key}"))],
+                MESSAGES,
+            )
+            .await
+        })
+    };
+    // Both sent with the old token; the CLI renews its login before either
+    // 401 arrives.
+    wait_for(|| up.count() == 2).await;
+    std::fs::write(env._dir.path().join("a.token"), "token-renewed").unwrap();
+    let (r1, r2) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!(
+        (r1.status, r2.status),
+        (200, 200),
+        "each retries once with the renewed token"
+    );
+    let seen = up.seen();
+    assert_eq!(seen.len(), 4);
+    assert!(
+        seen[..2]
+            .iter()
+            .all(|s| s.header("authorization") == Some("Bearer token-a"))
+    );
+    assert!(
+        seen[2..]
+            .iter()
+            .all(|s| s.header("authorization") == Some("Bearer token-renewed"))
+    );
+    // The late 401 did not reject the renewed token.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert_eq!(
+        send_owned(&c, &env, "/v1/messages", &[], MESSAGES)
+            .await
+            .status,
+        200
+    );
+    assert_ne!(account_view(&env, "a").state, AccountState::Disconnected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_stateful_session_recovers_its_own_account_login() {
+    let up = Mock::start(Act::sse(vec![CLAUDE_SSE])).await;
+    let other = Mock::start(Act::sse(vec![CLAUDE_SSE])).await;
+    let login_dir = tempfile::tempdir().unwrap();
+    let login = login_dir.path().join("credentials.json");
+    let now = relay_proxy::state::now_ms();
+    write_claude_login(&login, "old-token", now + EXPIRES_IN_MS);
+    let path = login.clone();
+    let env = proxy(
+        vec![
+            account("a", Provider::Anthropic, AccountMode::Pooled, &up.url()),
+            account("b", Provider::Anthropic, AccountMode::Pooled, &other.url()),
+        ],
+        move |c| {
+            c.accounts[0].credential = Some(SecretRef::File {
+                file: path,
+                format: SecretFormat::ClaudeCredentialsJson,
+            })
+        },
+    );
+    let c = client();
+    let s = [("x-claude-code-session-id", "s1")];
+    assert_eq!(
+        send_owned(&c, &env, "/v1/messages", &s, MESSAGES)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(up.count(), 1, "session bound to a");
+    sleep_until_ms(now + EXPIRES_IN_MS + 200).await;
+    write_claude_login(&login, "new-token", now + 3_600_000);
+    // A continuation with signed thinking can't move; it must recover a's
+    // own login without any unrelated request in between.
+    let cont = r#"{"model":"claude-sonnet-5-5","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":"sig"}]},{"role":"user","content":"go on"}]}"#;
+    let r = send_owned(&c, &env, "/v1/messages", &s, cont).await;
+    assert_eq!(r.status, 200);
+    assert_eq!((up.count(), other.count()), (2, 0));
+    assert_eq!(
+        up.seen()[1].header("authorization"),
+        Some("Bearer new-token")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_account_after_failover_still_reloads_on_401() {
+    let a = Mock::start(Act::json(
+        429,
+        r#"{"error":{"type":"rate_limit_exceeded"}}"#,
+    ))
+    .await;
+    let b = Mock::start(Act::sse(vec![CODEX_SSE])).await;
+    b.push(Act::Delay(
+        Duration::from_millis(300),
+        Box::new(Act::json(401, r#"{"error":{"type":"invalid_api_key"}}"#)),
+    ));
+    let env = proxy(
+        vec![
+            account("a", Provider::Openai, AccountMode::Pooled, &a.url()),
+            account("b", Provider::Openai, AccountMode::Pooled, &b.url()),
+        ],
+        |_| {},
+    );
+    let c = client();
+    let req = {
+        let (c, base, key) = (c.clone(), env.base(), env.key.clone());
+        tokio::spawn(async move {
+            send(
+                &c,
+                format!("{base}/v1/responses"),
+                &[("authorization", &format!("Bearer {key}"))],
+                FIRST_TURN,
+            )
+            .await
+        })
+    };
+    wait_for(|| b.count() == 1).await;
+    std::fs::write(env._dir.path().join("b.token"), "token-b2").unwrap();
+    let r = req.await.unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(b.count(), 2);
+    assert_eq!(b.seen()[1].header("authorization"), Some("Bearer token-b2"));
 }

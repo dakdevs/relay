@@ -62,6 +62,8 @@ pub struct AccountRt {
     /// Fingerprint of a token the provider rejected (401), so re-reading the
     /// same token doesn't resurrect it.
     pub rejected_token: Mutex<Option<u64>>,
+    /// Earliest time a broken file credential may be stat'ed again.
+    pub credential_next_stat: AtomicI64,
     /// Models seen, most recent first.
     pub models_seen: Mutex<VecDeque<String>>,
 }
@@ -72,6 +74,17 @@ const MODELS_SEEN: usize = 8;
 pub const RETRY_BROKEN_MS: i64 = 2_000;
 /// Change-check interval for a healthy file credential.
 pub const CHECK_HEALTHY_MS: i64 = 30_000;
+/// Change-check interval for a broken file credential.
+pub const STAT_EVERY_MS: i64 = 250;
+
+/// Kind of credential refresh a caller has claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// Re-read the source.
+    Reload,
+    /// Re-read only if the file changed since it was last read.
+    IfChanged,
+}
 
 const REJECTED: &str = "The provider rejected this credential (401). Sign in again with the CLI for this account; Relay picks up the new login automatically.";
 
@@ -99,6 +112,7 @@ impl AccountRt {
             reloading: tokio::sync::Mutex::new(()),
             credential_next_check: AtomicI64::new(0),
             rejected_token: Mutex::new(None),
+            credential_next_stat: AtomicI64::new(0),
             models_seen: Mutex::new(VecDeque::new()),
         }
     }
@@ -174,12 +188,6 @@ impl AccountRt {
             && model.is_none_or(|m| self.cfg.supports_model(m))
             && self.cooldown_until.load(Ordering::Relaxed) <= now
             && self.credential_ok(now)
-    }
-
-    /// Credential usable and not flagged (router-owned), or observed.
-    pub fn credential_healthy(&self, now: UnixMs) -> bool {
-        self.credential_ok(now)
-            && (!self.cfg.mode.router_owned() || lock(&self.credential_error).is_none())
     }
 
     /// Merges a quota update. Returns true when anything changed.
@@ -264,60 +272,94 @@ impl AccountRt {
         secrets::modified(r).is_some_and(|m| Some(m) != *lock(&self.credential_mtime))
     }
 
-    /// Marks the current credential rejected by the provider (401). It
-    /// stays unusable until its source holds a different token.
-    pub fn credential_rejected(&self) {
-        if let Some(c) = &*self.credential.load() {
-            *lock(&self.rejected_token) = Some(fingerprint(c.token.expose()));
-        }
-        *lock(&self.credential_error) = Some(REJECTED.into());
-        self.credential.store(None);
+    /// Whether the credential is loaded, unexpired and not flagged.
+    pub fn credential_usable(&self, now: UnixMs) -> bool {
+        self.credential_ok(now) && lock(&self.credential_error).is_none()
     }
 
-    /// Whether the credential source should be re-read now, without I/O
-    /// except a rate-limited `stat` of file credentials. Broken credentials
-    /// (missing, expired, rejected) are retried every [`RETRY_BROKEN_MS`]
-    /// or as soon as their file changes; healthy file credentials are
-    /// checked for changes every [`CHECK_HEALTHY_MS`]. Other sources have no
-    /// change signal, so they are only retried while broken.
-    pub fn needs_refresh(&self, now: UnixMs) -> bool {
-        let Some(r) = &self.cfg.credential else {
-            return false;
-        };
+    /// Claims the right to re-read the credential source now, without I/O.
+    /// At most one caller wins per interval (compare-and-swap on the
+    /// deadline), so concurrent requests never pile up reads:
+    ///
+    /// - broken (missing, expired, rejected) and [`RETRY_BROKEN_MS`] due:
+    ///   [`Refresh::Reload`];
+    /// - broken file credential, [`STAT_EVERY_MS`] due: [`Refresh::IfChanged`]
+    ///   (picks up a renewed login file within that interval);
+    /// - healthy file credential, [`CHECK_HEALTHY_MS`] due:
+    ///   [`Refresh::IfChanged`].
+    ///
+    /// Non-file sources have no change signal, so they are only re-read while
+    /// broken.
+    pub fn claim_refresh(&self, now: UnixMs) -> Option<Refresh> {
+        let r = self.cfg.credential.as_ref()?;
         if !self.cfg.mode.router_owned() || self.cfg.paused {
-            return false;
+            return None;
         }
-        let broken = !self.credential_ok(now) || lock(&self.credential_error).is_some();
-        let due = now >= self.credential_next_check.load(Ordering::Relaxed);
+        let broken = !self.credential_usable(now);
         let is_file = matches!(r, relay_core::config::SecretRef::File { .. });
+        let claim = |at: &AtomicI64, next: UnixMs| {
+            let due = at.load(Ordering::Relaxed);
+            now >= due
+                && at
+                    .compare_exchange(due, next, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+        };
         if broken {
-            due || (is_file && self.credential_file_changed())
+            if claim(&self.credential_next_check, now + RETRY_BROKEN_MS) {
+                return Some(Refresh::Reload);
+            }
+            if is_file && claim(&self.credential_next_stat, now + STAT_EVERY_MS) {
+                return Some(Refresh::IfChanged);
+            }
+            None
+        } else if is_file && claim(&self.credential_next_check, now + CHECK_HEALTHY_MS) {
+            Some(Refresh::IfChanged)
         } else {
-            is_file && due
+            None
         }
     }
 
-    /// Re-reads the credential source if [`AccountRt::needs_refresh`] says
-    /// so (blocking: file, keychain). Returns true when a usable credential
-    /// is loaded afterwards.
-    pub fn refresh_credential_blocking(&self) -> bool {
-        let now = now_ms();
-        if self.needs_refresh(now) {
-            let broken = !self.credential_ok(now) || lock(&self.credential_error).is_some();
-            if broken || self.credential_file_changed() {
-                self.load_credential();
-            }
-            let still_broken =
-                !self.credential_ok(now_ms()) || lock(&self.credential_error).is_some();
-            let wait = if still_broken {
-                RETRY_BROKEN_MS
-            } else {
-                CHECK_HEALTHY_MS
-            };
+    /// Performs a claimed refresh (blocking: file stat/read, keychain).
+    /// Call with [`AccountRt::reloading`] held. Returns whether the
+    /// credential is usable afterwards.
+    pub fn refresh_blocking(&self, kind: Refresh) -> bool {
+        let reload = match kind {
+            Refresh::Reload => true,
+            Refresh::IfChanged => self.credential_file_changed(),
+        };
+        if reload && !self.load_credential() {
             self.credential_next_check
-                .store(now_ms() + wait, Ordering::Relaxed);
+                .store(now_ms() + RETRY_BROKEN_MS, Ordering::Relaxed);
         }
-        self.credential_ok(now_ms()) && lock(&self.credential_error).is_none()
+        self.credential_usable(now_ms())
+    }
+
+    /// Handles a 401 for the credential that was actually `sent` (blocking;
+    /// call with [`AccountRt::reloading`] held). Returns true when a usable
+    /// credential different from `sent` is loaded, so the request may be
+    /// retried once on this account.
+    ///
+    /// Only the sent token is marked rejected: if another request already
+    /// loaded a renewed token, that token is kept untouched.
+    pub fn on_unauthorized_blocking(&self, sent: &Credential) -> bool {
+        let sent_fp = fingerprint(sent.token.expose());
+        let now = now_ms();
+        let differs = |c: &Option<Arc<Credential>>| {
+            c.as_ref()
+                .is_some_and(|c| fingerprint(c.token.expose()) != sent_fp)
+        };
+        if differs(&self.credential.load_full()) && self.credential_usable(now) {
+            return true;
+        }
+        *lock(&self.rejected_token) = Some(sent_fp);
+        if !self.load_credential() {
+            // Rejected or unreadable: retry the source on the broken cadence
+            // (not the healthy one), whatever its kind.
+            self.credential_next_check
+                .store(now + RETRY_BROKEN_MS, Ordering::Relaxed);
+            return false;
+        }
+        differs(&self.credential.load_full())
     }
 
     /// Credential expiry in the future, for snapshot scheduling.
@@ -598,6 +640,85 @@ mod tests {
             max_in_flight: max,
             models: vec![],
         }
+    }
+
+    fn pooled_file(path: &std::path::Path) -> AccountRt {
+        let mut c = cfg("p", 4);
+        c.mode = AccountMode::Pooled;
+        c.credential = Some(relay_core::config::SecretRef::File {
+            file: path.to_path_buf(),
+            format: relay_core::config::SecretFormat::Raw,
+        });
+        AccountRt::new(c)
+    }
+
+    fn token(a: &AccountRt) -> Option<String> {
+        a.credential
+            .load()
+            .as_ref()
+            .map(|c| c.token.expose().to_string())
+    }
+
+    #[test]
+    fn refresh_claims_are_exclusive_and_rate_limited_without_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = pooled_file(&dir.path().join("missing.token"));
+        // Broken and due: exactly one caller wins the full reload…
+        assert_eq!(a.claim_refresh(1_000), Some(Refresh::Reload));
+        // …then one caller wins the cheap change check, then nobody.
+        assert_eq!(a.claim_refresh(1_000), Some(Refresh::IfChanged));
+        assert_eq!(a.claim_refresh(1_100), None);
+        assert_eq!(
+            a.claim_refresh(1_000 + STAT_EVERY_MS),
+            Some(Refresh::IfChanged)
+        );
+        assert_eq!(
+            a.claim_refresh(1_000 + RETRY_BROKEN_MS),
+            Some(Refresh::Reload)
+        );
+        // Healthy file credentials are only checked on the slow cadence.
+        std::fs::write(dir.path().join("t"), "tok").unwrap();
+        let b = pooled_file(&dir.path().join("t"));
+        assert!(b.load_credential());
+        b.credential_next_check.store(5_000, Ordering::Relaxed);
+        assert_eq!(b.claim_refresh(4_999), None);
+        assert_eq!(b.claim_refresh(5_000), Some(Refresh::IfChanged));
+        assert_eq!(b.claim_refresh(5_000), None);
+        // Paused accounts are never refreshed.
+        let mut paused = pooled_file(&dir.path().join("t"));
+        paused.cfg.paused = true;
+        assert_eq!(paused.claim_refresh(0), None);
+    }
+
+    #[test]
+    fn late_401_for_old_token_keeps_renewed_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t");
+        std::fs::write(&f, "old").unwrap();
+        let a = pooled_file(&f);
+        assert!(a.load_credential());
+        let sent_old = a.credential.load_full().unwrap();
+        // Another request already renewed the token.
+        std::fs::write(&f, "new").unwrap();
+        assert!(a.load_credential());
+        // A late 401 for the old token must not touch the new one.
+        assert!(a.on_unauthorized_blocking(&sent_old));
+        assert_eq!(token(&a).as_deref(), Some("new"));
+        assert!(a.credential_usable(now_ms()));
+        // A 401 for the current token rejects it; re-reading the same token
+        // does not resurrect it, and the source is retried on the broken
+        // cadence whatever its kind.
+        let sent_new = a.credential.load_full().unwrap();
+        let before = now_ms();
+        assert!(!a.on_unauthorized_blocking(&sent_new));
+        assert_eq!(token(&a), None);
+        let next = a.credential_next_check.load(Ordering::Relaxed);
+        assert!(next >= before + RETRY_BROKEN_MS && next < before + CHECK_HEALTHY_MS);
+        assert!(!a.load_credential());
+        // A different token in the source is accepted again.
+        std::fs::write(&f, "newer").unwrap();
+        assert!(a.load_credential());
+        assert_eq!(token(&a).as_deref(), Some("newer"));
     }
 
     #[test]
