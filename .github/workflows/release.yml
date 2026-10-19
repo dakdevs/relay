@@ -48,7 +48,7 @@ jobs:
     needs: verify
     name: ${{ matrix.target }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
