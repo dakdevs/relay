@@ -16,7 +16,7 @@
 <p align="center"><sub><b>Native GPUI render with sample data.</b> Rendered offscreen from Relay's own views; no live accounts. <a href="https://app.paper.design/file/01M58Z151ZVWZ4VVK921R3Q5J9/p-2-0">Approved design</a></sub></p>
 
 > [!NOTE]
-> Relay is early. The repository is private and no release has been published yet, so the public one-line installer below doesn't work yet. Installing needs the GitHub CLI logged in to an account with access to `dakdevs/relay`.
+> Relay is early. The first release is [20261018.1](https://github.com/dakdevs/relay/releases/tag/v20261018.1). The repository is private, so the public one-line installer below doesn't work yet; installing needs the GitHub CLI logged in to an account with access to `dakdevs/relay`.
 
 ## What it does
 
