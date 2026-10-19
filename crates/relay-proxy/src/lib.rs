@@ -114,7 +114,7 @@ impl Handle {
         config.validate()?;
         let prev = self.shared.registry.load_full();
         let next = Arc::new(Registry::build(config, Some(&prev)));
-        load_credentials(&next);
+        load_credentials(&self.shared, &next);
         self.shared.registry.store(next);
         self.shared.changed();
         Ok(())
@@ -188,7 +188,8 @@ impl Drop for Handle {
 }
 
 /// Loads credentials for router-owned accounts that lack one, off-thread.
-fn load_credentials(reg: &Arc<Registry>) {
+/// Publishes a snapshot after each load, so the UI shows the result.
+fn load_credentials(shared: &Arc<Shared>, reg: &Arc<Registry>) {
     let pending: Vec<_> = reg
         .accounts
         .iter()
@@ -198,11 +199,13 @@ fn load_credentials(reg: &Arc<Registry>) {
     if pending.is_empty() {
         return;
     }
+    let shared = shared.clone();
     let _ = std::thread::Builder::new()
         .name("relay-credentials".into())
         .spawn(move || {
             for a in pending {
                 a.load_credential();
+                shared.changed();
             }
         });
 }
@@ -247,9 +250,8 @@ pub fn start(paths: &Paths, config: Config) -> Result<Handle, StartError> {
     let header_timeout = Duration::from_millis(config.server.response_header_timeout_ms);
     let started = config.clone();
     let registry = Arc::new(Registry::build(config, None));
-    load_credentials(&registry);
     let shared = Arc::new(Shared {
-        registry: ArcSwap::new(registry),
+        registry: ArcSwap::new(registry.clone()),
         sessions: Default::default(),
         paused: AtomicBool::new(false),
         dirty: AtomicBool::new(true),
@@ -260,6 +262,7 @@ pub fn start(paths: &Paths, config: Config) -> Result<Handle, StartError> {
         version: AtomicU64::new(0),
         addr,
     });
+    load_credentials(&shared, &registry);
     let (first, _) = shared.build_snapshot(now_ms());
     let first = Arc::new(first);
     let snapshot = Arc::new(ArcSwap::new(first.clone()));

@@ -340,7 +340,9 @@ impl AccountRt {
     /// retried once on this account.
     ///
     /// Only the sent token is marked rejected: if another request already
-    /// loaded a renewed token, that token is kept untouched.
+    /// loaded a renewed token, that token is kept untouched, and a late 401
+    /// for an older token never replaces a newer rejection (which would let
+    /// the newer, revoked token load again).
     pub fn on_unauthorized_blocking(&self, sent: &Credential) -> bool {
         let sent_fp = fingerprint(sent.token.expose());
         let now = now_ms();
@@ -351,7 +353,16 @@ impl AccountRt {
         if differs(&self.credential.load_full()) && self.credential_usable(now) {
             return true;
         }
-        *lock(&self.rejected_token) = Some(sent_fp);
+        {
+            let mut rejected = lock(&self.rejected_token);
+            // With no current credential and a rejection of a different
+            // token on record, `sent` is stale: that newer rejection stands.
+            let newer_rejection =
+                self.credential.load().is_none() && rejected.is_some_and(|fp| fp != sent_fp);
+            if !newer_rejection {
+                *rejected = Some(sent_fp);
+            }
+        }
         if !self.load_credential() {
             // Rejected or unreadable: retry the source on the broken cadence
             // (not the healthy one), whatever its kind.
@@ -719,6 +730,34 @@ mod tests {
         std::fs::write(&f, "newer").unwrap();
         assert!(a.load_credential());
         assert_eq!(token(&a).as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn late_401_for_old_token_never_resurrects_a_rejected_newer_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t");
+        std::fs::write(&f, "old").unwrap();
+        let acc = pooled_file(&f);
+        assert!(acc.load_credential());
+        // Requests A and B are sent with OLD.
+        let sent_old = acc.credential.load_full().unwrap();
+        // The CLI renews; A's 401 loads NEW and A retries with it.
+        std::fs::write(&f, "new").unwrap();
+        assert!(acc.on_unauthorized_blocking(&sent_old));
+        assert_eq!(token(&acc).as_deref(), Some("new"));
+        // Request C is sent with NEW, which is revoked too.
+        let sent_new = acc.credential.load_full().unwrap();
+        assert!(!acc.on_unauthorized_blocking(&sent_new));
+        assert_eq!(token(&acc), None);
+        // B's late 401 for OLD must not lift NEW's rejection.
+        assert!(!acc.on_unauthorized_blocking(&sent_old));
+        assert_eq!(token(&acc), None, "NEW stays rejected");
+        assert!(!acc.credential_usable(now_ms()));
+        assert!(!acc.load_credential());
+        // A different token in the source is still accepted.
+        std::fs::write(&f, "newest").unwrap();
+        assert!(acc.load_credential());
+        assert_eq!(token(&acc).as_deref(), Some("newest"));
     }
 
     #[test]
