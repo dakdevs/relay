@@ -90,7 +90,10 @@ want_epoch="$(TZ=UTC date -j -f '%Y%m%d%H%M%S' "${version%%.*}000000" +%s 2>/dev
 mx="$scratch/mtime"
 mkdir "$mx"
 tar -xzf "$dist/relay-$version-linux-x86_64.tar.gz" -C "$mx"
-file_epoch="$(stat -f %m "$mx/relay-$version-linux-x86_64/bin/relay" 2>/dev/null || stat -c %Y "$mx/relay-$version-linux-x86_64/bin/relay")"
+# `date -r FILE` prints the modification time on both GNU and BSD; `stat -f`
+# means different things on the two.
+file_epoch="$(date -r "$mx/relay-$version-linux-x86_64/bin/relay" +%s)"
+check "version-date oracle is a plain epoch" test -n "$want_epoch" -a -z "${want_epoch//[0-9]/}"
 check "entries are dated 00:00 UTC on the version date" test "$file_epoch" == "$want_epoch"
 
 # --- Checksums and pinned installer ---------------------------------------------

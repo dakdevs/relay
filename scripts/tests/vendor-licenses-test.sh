@@ -41,6 +41,10 @@ put o/bare "$c2" NOTICE "notice without a license"
 # tagged and head: no published commit recorded.
 put o/tagged "$tagc" COPYING "tagged copying"
 put o/head "$headc" LICENSE "head license"
+# flaky: two license files; the second download can be made to fail.
+flakyc="$(printf '5%.0s' {1..40})"
+put o/flaky "$flakyc" LICENSE-APACHE "flaky apache"
+put o/flaky "$flakyc" LICENSE-MIT "flaky mit"
 printf 'o/tagged refs/tags/v1.0.0 %s\no/head HEAD %s\n' "$tagc" "$headc" >"$fx/refs"
 
 mkdir "$scratch/bin"
@@ -70,6 +74,7 @@ contents*)
   sub="${sub%%\?ref=*}"
   target="$FIX/$project/$ref/$sub"
   if [ "$raw" = 1 ]; then
+    [ -n "${FAIL_RAW:-}" ] && [ "$sub" = "$FAIL_RAW" ] && exit 1
     [ -f "$target" ] && exec cat "$target"
     exit 1
   fi
@@ -81,6 +86,9 @@ esac
 exit 1
 EOF
 chmod +x "$scratch/bin/gh"
+# The fixture has no GitLab project; curl must not reach the network.
+printf '#!/bin/sh\nexit 7\n' >"$scratch/bin/curl"
+chmod +x "$scratch/bin/curl"
 
 reg="$scratch/registry"
 mkdir -p "$reg/nested" "$reg/bare" "$reg/tagged" "$reg/head"
@@ -123,6 +131,17 @@ check "summary counts one gap" grep -qx 'vendor-licenses.sh: 1 crate(s) without 
 cp "$index" "$scratch/index.before"
 env FIX="$fx" PATH="$scratch/bin:$PATH" "$repo/scripts/vendor-licenses.sh" x86_64-unknown-linux-gnu >/dev/null 2>&1
 check "rerun leaves the index unchanged" cmp -s "$scratch/index.before" "$index"
+
+# A crate whose download fails part-way is left out entirely and retried.
+mkdir -p "$reg/flaky"
+printf '{"git":{"sha1":"%s"},"path_in_vcs":""}\n' "$flakyc" >"$reg/flaky/.cargo_vcs_info.json"
+row flaky https://github.com/o/flaky >>"$scratch/missing"
+env FIX="$fx" FAIL_RAW=LICENSE-MIT PATH="$scratch/bin:$PATH" "$repo/scripts/vendor-licenses.sh" x86_64-unknown-linux-gnu >"$out" 2>&1 || true
+check "failed download is reported for retry" grep -q 'gap: flaky 1.0.0: could not download LICENSE-MIT .*rerun to retry' "$out"
+check "failed download leaves no partial rows" test -z "$(rows flaky)"
+check "failed download leaves the rest of the index alone" cmp -s "$scratch/index.before" "$index"
+env FIX="$fx" PATH="$scratch/bin:$PATH" "$repo/scripts/vendor-licenses.sh" x86_64-unknown-linux-gnu >"$out" 2>&1
+check "rerun vendors the whole crate" test "$(rows flaky)" == "LICENSE-APACHE|$flakyc|published-commit LICENSE-MIT|$flakyc|published-commit "
 
 rm "$repo/scripts/third-party.sh"
 printf '#!/bin/sh\necho "broken" >&2\nexit 1\n' >"$repo/scripts/third-party.sh"

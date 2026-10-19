@@ -146,18 +146,31 @@ while IFS=$'\x1f' read -r name ver _ repo dir homepage; do
     gaps=$((gaps + 1))
     continue
   fi
+  # All of a crate's files or none: a crate with a failed download stays out
+  # of the index, so the next run retries it instead of skipping it.
+  : >"$work/rows"
+  complete=1
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
-    fetch "$host" "$project" "$commit" "$path" "$work/f"
-    [[ -s "$work/f" ]] || {
-      echo "gap: $name $ver: empty $path"
-      continue
-    }
+    if ! fetch "$host" "$project" "$commit" "$path" "$work/f" 2>/dev/null || [[ ! -s "$work/f" ]]; then
+      echo "gap: $name $ver: could not download $path from $repo at $commit; rerun to retry"
+      complete=0
+      break
+    fi
     sum="$(sha256 "$work/f" | awk '{ print $1 }')"
-    cp "$work/f" "$store/$sum"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$ver" "$repo" "$commit" "$path" "$sum" "$how" >>"$index"
-    echo "vendored: $name $ver $path ($how ${commit:0:12})"
+    cp "$work/f" "$work/store-$sum"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$ver" "$repo" "$commit" "$path" "$sum" "$how" >>"$work/rows"
   done <<<"$paths$notices"
+  if ((complete == 0)); then
+    rm -f "$work"/store-*
+    gaps=$((gaps + 1))
+    continue
+  fi
+  for f in "$work"/store-*; do mv "$f" "$store/${f##*/store-}"; done
+  cat "$work/rows" >>"$index"
+  while IFS=$'\t' read -r _ _ _ _ path _ _; do
+    echo "vendored: $name $ver $path ($how ${commit:0:12})"
+  done <"$work/rows"
 done <"$work/missing.tsv"
 
 {

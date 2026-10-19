@@ -74,4 +74,4 @@ macOS builds are ad-hoc signed only (`codesign --sign -`). They are not signed w
 
 ## Local checks
 
-`scripts/test.sh` runs syntax checks, shellcheck and the version, packaging, installer and third-party license tests. It is offline, writes only to temporary directories and launches nothing. `scripts/smoke.sh`, `scripts/ci-linux-deps.sh` and `scripts/ci-rust-toolchain.sh` refuse to run outside CI: the first opens the app, the second uses `sudo apt-get`, and the third may install rustup.
+`scripts/test.sh` runs syntax checks, shellcheck and the tests in `scripts/tests/`: version, packaging and installer, third-party licenses, Linux linkage, and license vendoring. It is offline, writes only to temporary directories and launches nothing. `scripts/smoke.sh`, `scripts/ci-linux-deps.sh` and `scripts/ci-rust-toolchain.sh` refuse to run outside CI: the first opens the app, the second uses `sudo apt-get`, and the third may install rustup.
