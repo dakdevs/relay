@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2A8662"/>
+      <stop offset="1" stop-color="#1F6B4F"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
+  <g transform="translate(512 512) scale(30) translate(-8.8 -9)" fill="none" stroke="#F2F3F2" stroke-width="1.7" stroke-linecap="round">
+    <circle cx="3.6" cy="9" r="2" fill="#F2F3F2" stroke="none"/>
+    <path d="M5.4 9h3.2M8.6 9l5-4.2M8.6 9l5 4.2"/>
+    <circle cx="14.4" cy="4.4" r="1.6" fill="#F2F3F2" stroke="none"/>
+    <circle cx="14.4" cy="13.6" r="1.6" fill="#F2F3F2" stroke="none"/>
+  </g>
+</svg>

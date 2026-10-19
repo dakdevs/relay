@@ -1,0 +1,20 @@
+[package]
+name = "relay-providers"
+description = "Anthropic Messages and OpenAI Responses wire adapters: request inspection, header rules, quota headers and streaming usage taps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+relay-core.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+http.workspace = true
+memchr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

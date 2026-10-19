@@ -1,0 +1,5 @@
+[toolchain]
+# Matches the compiler pinned by zed-industries/zed@56934ec0, which GPUI is built from.
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

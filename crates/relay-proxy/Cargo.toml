@@ -1,0 +1,41 @@
+[package]
+name = "relay-proxy"
+description = "Loopback HTTP proxy for Anthropic Messages and OpenAI Responses with quota-aware account routing, plus the headless `relay-proxy` binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "relay-proxy"
+path = "src/main.rs"
+
+[dependencies]
+relay-core.workspace = true
+relay-providers.workspace = true
+relay-usage.workspace = true
+arc-swap.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tower-service.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bench]]
+name = "overhead"
+harness = false
+
+[lints]
+workspace = true

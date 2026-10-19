@@ -1,0 +1,62 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "20261018.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+repository = "https://github.com/dakdevs/relay"
+
+[workspace.dependencies]
+relay-core = { path = "crates/relay-core" }
+relay-providers = { path = "crates/relay-providers" }
+relay-usage = { path = "crates/relay-usage" }
+relay-proxy = { path = "crates/relay-proxy" }
+
+arc-swap = "1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+memchr = "2"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server", "server-auto", "server-graceful", "http1", "http2", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "io-util"] }
+tokio-util = "0.7"
+toml = "1"
+tower-service = "0.3"
+tempfile = "3"
+criterion = { version = "0.8", default-features = false }
+
+gpui = { git = "https://github.com/zed-industries/zed", rev = "56934ec0560bce8929025497411de7f5322fb6ca", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "56934ec0560bce8929025497411de7f5322fb6ca", default-features = false, features = ["font-kit", "wayland", "x11"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+[profile.bench]
+debug = false
+# Keep benches independent of rust-objcopy (absent from some minimal toolchains).
+strip = false
+
+# Zed's own [patch.crates-io] does not propagate to git consumers; GPUI needs these.
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }

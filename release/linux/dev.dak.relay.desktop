@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Relay
+GenericName=Quota-aware AI router
+Comment=Route Claude Code and Codex through your own accounts and track quota
+Exec=relay
+Icon=dev.dak.relay
+Terminal=false
+Categories=Development;Utility;
+Keywords=claude;codex;quota;router;
+StartupNotify=false

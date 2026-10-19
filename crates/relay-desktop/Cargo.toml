@@ -1,0 +1,49 @@
+[package]
+name = "relay-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono.workspace = true
+futures = "0.3"
+gpui.workspace = true
+gpui_platform.workspace = true
+unicode-segmentation = "1"
+relay-core.workspace = true
+relay-proxy.workspace = true
+relay-usage.workspace = true
+# Same version GPUI already builds; used only to rasterise the tray glyph.
+resvg = { version = "0.46", default-features = false }
+tokio.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["test-support"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
+tempfile.workspace = true
+
+# Offscreen Metal render of the popover and main window (no window shown).
+# Needs the main thread, so it runs without the libtest harness.
+[[test]]
+name = "render"
+harness = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Shaders compile at launch, so builds need no separately downloaded Metal Toolchain.
+gpui_platform = { workspace = true, features = ["runtime_shaders"] }
+tray-icon = { version = "0.26.1", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "relay-usage"
+description = "Usage recording off the request path: bounded ingest, batched SQLite writer and read queries for the UI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+relay-core.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

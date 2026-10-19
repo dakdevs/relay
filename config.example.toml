@@ -1,0 +1,74 @@
+# Relay configuration example. Copy to the Relay directory as config.toml:
+#   macOS: ~/Library/Application Support/Relay/config.toml
+#   Linux: $XDG_CONFIG_HOME/relay/config.toml (default ~/.config/relay/config.toml)
+#   any:   $RELAY_HOME/config.toml when RELAY_HOME is set
+# Check it without starting anything: relay-proxy check
+#
+# This file holds secret *references* only. Relay reads a referenced secret
+# when the account is enabled, never logs it, and never writes it back.
+
+[server]
+listen = "127.0.0.1:8787"   # loopback only; other addresses are rejected
+# local_key = { env = "RELAY_LOCAL_KEY" }  # default: generated ./local-key (0600)
+max_body_bytes = 33554432
+queue_wait_ms = 2000
+connect_timeout_ms = 10000          # TCP connect + TLS handshake
+response_header_timeout_ms = 600000 # after sending; expiry is ambiguous, never retried
+
+[routing]
+strategy = "quota-aware"     # or "fill-first", "round-robin"
+sticky = true                # running sessions stay on their account
+session_ttl_minutes = 360
+skip_below_pct = 5.0
+default_pool = "pooled"      # pool for router-owned requests without x-relay-pool
+bootstrap_hold_ms = 1500     # 0 disables in-stream rejection failover
+idle_poll = false            # unsupported: no documented non-billed quota read
+
+[upstreams]
+# Relay forwards only to these origins.
+allowed = ["https://api.anthropic.com", "https://api.openai.com", "https://chatgpt.com"]
+
+[usage]
+enabled = true
+raw_retention_days = 7
+hourly_retention_days = 400
+
+[ui]
+period = "week"              # Through Relay: "week" or "month"
+theme = "system"
+# week_start = 0             # 0 = Monday … 6 = Sunday
+
+# Observed (default): the T3 instance keeps its own login; Relay forwards it
+# unchanged and records usage and quota.
+[[accounts]]
+id = "claude-personal"
+provider = "anthropic"
+label = "Personal"
+mode = "observed"
+plan = "Max 20×"
+identifier = "d••@example.com"
+
+# API key, billed to the key owner. Never substituted for a subscription.
+[[accounts]]
+id = "openai-platform"
+provider = "openai"
+label = "Platform"
+mode = "key"
+credential = { env = "RELAY_OPENAI_KEY" }
+
+# Pooled (opt-in; provider terms for pooling one's own subscriptions are
+# unresolved). Relay reads the CLI's own login file and never refreshes it,
+# so the CLI keeps ownership of its login.
+# [[accounts]]
+# id = "codex-work"
+# provider = "openai"
+# label = "Work"
+# mode = "pooled"
+# credential = { file = "/path/to/codex-home/auth.json", format = "codex-auth-json" }
+#
+# [[accounts]]
+# id = "claude-work"
+# provider = "anthropic"
+# label = "Work"
+# mode = "pooled"
+# credential = { keychain_service = "relay", keychain_account = "claude-work", format = "claude-credentials-json" }
