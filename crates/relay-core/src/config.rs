@@ -3,7 +3,7 @@
 //! Secrets are never stored in config: an account names *where* its
 //! credential lives ([`SecretRef`]), and Relay resolves it at runtime.
 
-use crate::model::{AccountId, AccountMode, CredentialKind, Pool, Provider};
+use crate::model::{AccountId, AccountMode, CredentialKind, Pool, Provider, Vendor};
 use crate::select::Strategy;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -111,6 +111,66 @@ pub const ANTHROPIC_API: &str = "https://api.anthropic.com";
 pub const OPENAI_API: &str = "https://api.openai.com/v1";
 /// ChatGPT-login Codex backend. Not a documented public API.
 pub const CHATGPT_CODEX: &str = "https://chatgpt.com/backend-api/codex";
+/// Kimi Code base on kimi.com: Messages at `/coding/v1/messages`.
+pub const KIMI_COM_CODING: &str = "https://api.kimi.com/coding";
+/// Kimi Code Responses base on kimi.com: `/coding/v1/responses`.
+pub const KIMI_COM_CODING_V1: &str = "https://api.kimi.com/coding/v1";
+/// Kimi Code base on kimi.ai: Messages at `/coding/v1/messages`.
+pub const KIMI_AI_CODING: &str = "https://api.kimi.ai/coding";
+/// Kimi Code Responses base on kimi.ai: `/coding/v1/responses`.
+pub const KIMI_AI_CODING_V1: &str = "https://api.kimi.ai/coding/v1";
+/// xAI public API. Not the Grok CLI chat proxy, which needs CLI identity.
+pub const XAI_API: &str = "https://api.x.ai/v1";
+/// Meta AI API. A sign-in may report another base URL; Relay ignores it.
+pub const META_API: &str = "https://api.meta.ai/v1";
+
+/// Canonical upstream base for a vendor, wire and credential kind; `None`
+/// when the vendor does not serve that wire or credential kind. This
+/// catalog is the only place new-vendor destinations come from.
+pub fn vendor_base(vendor: Vendor, wire: Provider, kind: CredentialKind) -> Option<&'static str> {
+    if !vendor.serves(wire) || !vendor.accepts(kind) {
+        return None;
+    }
+    Some(match (vendor, wire, kind) {
+        (Vendor::Anthropic, _, _) => ANTHROPIC_API,
+        (Vendor::Openai, _, CredentialKind::ApiKey) => OPENAI_API,
+        (Vendor::Openai, _, CredentialKind::Subscription) => CHATGPT_CODEX,
+        (Vendor::KimiCom, Provider::Anthropic, _) => KIMI_COM_CODING,
+        (Vendor::KimiCom, Provider::Openai, _) => KIMI_COM_CODING_V1,
+        (Vendor::KimiAi, Provider::Anthropic, _) => KIMI_AI_CODING,
+        (Vendor::KimiAi, Provider::Openai, _) => KIMI_AI_CODING_V1,
+        (Vendor::Xai, _, _) => XAI_API,
+        (Vendor::Meta, _, _) => META_API,
+    })
+}
+
+/// The non-first-party vendor whose domain contains `host` (canonical, see
+/// [`canonical_host`]), on any port. An account of any other vendor may
+/// never target it, so a token can't be sent to the wrong vendor.
+fn vendor_owning(host: &str) -> Option<Vendor> {
+    [
+        (Vendor::KimiCom, "kimi.com"),
+        (Vendor::KimiAi, "kimi.ai"),
+        (Vendor::Xai, "x.ai"),
+        (Vendor::Meta, "meta.ai"),
+    ]
+    .into_iter()
+    .find(|(_, d)| {
+        host.strip_suffix(d)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
+    })
+    .map(|(v, _)| v)
+}
+
+/// Valid device ids are 1–128 chars of `[A-Za-z0-9-_.]`, safe as a header
+/// value.
+fn device_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
 
 impl Default for UpstreamsConfig {
     fn default() -> Self {
@@ -190,8 +250,16 @@ pub struct UiPrefs {
 pub struct AccountConfig {
     /// Stable id (`[a-z0-9-_]`, ≤64). Clients name it in `x-relay-account`.
     pub id: AccountId,
-    /// Provider.
+    /// Wire protocol the account serves (Messages or Responses).
     pub provider: Provider,
+    /// Vendor operating the upstream. `None` is the wire's first-party
+    /// vendor, so configs written before vendors existed are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<Vendor>,
+    /// Per-install device id the vendor bound at sign-in (Kimi
+    /// `X-Msh-Device-Id`). An identifier, not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     /// Stable display label (Personal, Work, …).
     pub label: String,
     /// Routing mode.
@@ -206,7 +274,9 @@ pub struct AccountConfig {
     /// may log in with an API key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_kind: Option<CredentialKind>,
-    /// Upstream base URL. Defaults per provider and mode; must be allowed.
+    /// Upstream base URL. Defaults per vendor, wire and credential kind;
+    /// must be allowed. New vendors accept only their catalog base, or an
+    /// allowed loopback origin for local testing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
     /// Credential location for pooled and key accounts. Observed accounts
@@ -235,16 +305,20 @@ impl AccountConfig {
             .unwrap_or_else(|| CredentialKind::for_mode(self.mode))
     }
 
-    /// Upstream base URL with defaults applied.
+    /// Vendor with the first-party default applied.
+    pub fn vendor(&self) -> Vendor {
+        self.vendor
+            .unwrap_or_else(|| Vendor::first_party(self.provider))
+    }
+
+    /// Upstream base URL with defaults applied. Empty when the vendor does
+    /// not serve this wire or credential kind ([`Config::validate`]
+    /// rejects that).
     pub fn upstream_base(&self) -> &str {
         if let Some(u) = &self.upstream {
             return u.trim_end_matches('/');
         }
-        match (self.provider, self.credential_kind()) {
-            (Provider::Anthropic, _) => ANTHROPIC_API,
-            (Provider::Openai, CredentialKind::ApiKey) => OPENAI_API,
-            (Provider::Openai, CredentialKind::Subscription) => CHATGPT_CODEX,
-        }
+        vendor_base(self.vendor(), self.provider, self.credential_kind()).unwrap_or("")
     }
 
     /// Whether the allow-list admits `model`.
@@ -314,7 +388,19 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Splits a URL into `(scheme, host, port, path)` without a URL crate.
+///
+/// Strict, so no other parser can read a different host: rejects userinfo,
+/// `?`, `#`, `%`, `\`, whitespace, control and non-ASCII characters
+/// anywhere, hosts that are neither DNS names (`[A-Za-z0-9-]` labels, one
+/// optional trailing dot) nor bracketed IPv6 literals, and bad ports. The
+/// host is returned as written; compare it with [`canonical_host`].
 pub fn split_url(url: &str) -> Option<(&str, &str, Option<u16>, &str)> {
+    if url
+        .bytes()
+        .any(|b| matches!(b, b'?' | b'#' | b'%' | b'\\' | b'@') || !b.is_ascii_graphic())
+    {
+        return None;
+    }
     let (scheme, rest) = url.split_once("://")?;
     if scheme != "http" && scheme != "https" {
         return None;
@@ -323,27 +409,53 @@ pub fn split_url(url: &str) -> Option<(&str, &str, Option<u16>, &str)> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
     };
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.ends_with(']') || authority.starts_with('[') => {
-            (h, Some(p.parse().ok()?))
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (ip, after) = inner.split_once(']')?;
+        ip.parse::<std::net::Ipv6Addr>().ok()?;
+        let port = match after {
+            "" => None,
+            p => Some(p.strip_prefix(':')?.parse().ok()?),
+        };
+        (&authority[..ip.len() + 2], port)
+    } else {
+        let (host, port) = match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p.parse().ok()?)),
+            None => (authority, None),
+        };
+        let name = host.strip_suffix('.').unwrap_or(host);
+        let dns = !name.is_empty()
+            && name.split('.').all(|l| {
+                !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            });
+        if !dns {
+            return None;
         }
-        _ => (authority, None),
+        (host, port)
     };
     Some((scheme, host, port, path))
 }
 
+/// Lower-case host without the trailing DNS dot: the form every origin
+/// comparison uses.
+fn canonical_host(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+}
+
+/// `scheme://host[:port]` with a canonical host and the scheme's default
+/// port omitted, so spellings of one origin compare equal.
 fn origin_of(url: &str) -> Option<String> {
     let (scheme, host, port, _) = split_url(url)?;
-    Some(match port {
-        Some(p) => format!("{scheme}://{}:{p}", host.to_ascii_lowercase()),
-        None => format!("{scheme}://{}", host.to_ascii_lowercase()),
-    })
+    let host = canonical_host(host);
+    Some(
+        match port.filter(|p| !matches!((scheme, *p), ("https", 443) | ("http", 80))) {
+            Some(p) => format!("{scheme}://{host}:{p}"),
+            None => format!("{scheme}://{host}"),
+        },
+    )
 }
 
 fn is_loopback_host(host: &str) -> bool {
+    let host = canonical_host(host);
     host == "localhost"
         || host
             .trim_start_matches('[')
@@ -426,15 +538,68 @@ impl Config {
             if acc.mode == AccountMode::Key && acc.credential_kind() != CredentialKind::ApiKey {
                 err(format!("account {id}: key accounts use API keys"));
             }
+            let vendor = acc.vendor();
+            if !vendor.serves(acc.provider) {
+                err(format!(
+                    "account {id}: {} does not serve the {} wire",
+                    vendor.label(),
+                    acc.provider.label()
+                ));
+                continue;
+            }
+            if !vendor.accepts(acc.credential_kind()) {
+                err(format!(
+                    "account {id}: {} accounts are subscription sign-ins, not API keys",
+                    vendor.label()
+                ));
+                continue;
+            }
+            match (&acc.device_id, vendor.needs_device_id()) {
+                (Some(d), true) if !device_id_ok(d) => err(format!(
+                    "account {id}: device_id must be 1–128 of A-Z, a-z, 0-9, -, _ and ."
+                )),
+                (Some(_), false) => err(format!(
+                    "account {id}: device_id is only used by Kimi accounts"
+                )),
+                (None, true) if acc.mode.router_owned() => err(format!(
+                    "account {id}: {} needs the device id from its sign-in",
+                    vendor.label()
+                )),
+                _ => {}
+            }
             let base = acc.upstream_base();
-            match origin_of(base) {
-                Some(o) if allowed.contains(&o) => {}
-                Some(o) => err(format!(
-                    "account {id}: upstream {o} is not in upstreams.allowed"
-                )),
-                None => err(format!(
+            let (Some(o), Some((_, host, _, _))) = (origin_of(base), split_url(base)) else {
+                err(format!(
                     "account {id}: upstream {base:?} is not an http(s) URL"
-                )),
+                ));
+                continue;
+            };
+            if let Some(other) = vendor_owning(&canonical_host(host)).filter(|v| *v != vendor) {
+                err(format!(
+                    "account {id}: upstream {o} belongs to {}, not {}",
+                    other.label(),
+                    vendor.label()
+                ));
+                continue;
+            }
+            let catalog = vendor_base(vendor, acc.provider, acc.credential_kind());
+            let ok = if vendor.is_first_party() {
+                allowed.contains(&o)
+            } else {
+                // Exactly the catalog base, or an allow-listed loopback
+                // origin (local tests). Never another remote origin.
+                Some(base) == catalog || (allowed.contains(&o) && is_loopback_host(host))
+            };
+            if !ok {
+                err(if vendor.is_first_party() {
+                    format!("account {id}: upstream {o} is not in upstreams.allowed")
+                } else {
+                    format!(
+                        "account {id}: {} accounts must use {}",
+                        vendor.label(),
+                        catalog.unwrap_or("its catalog upstream")
+                    )
+                });
             }
         }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
@@ -454,6 +619,8 @@ mod tests {
         AccountConfig {
             id: AccountId(id.into()),
             provider: Provider::Anthropic,
+            vendor: None,
+            device_id: None,
             label: "Personal".into(),
             mode,
             plan: None,
@@ -543,6 +710,210 @@ mod tests {
         assert_eq!(a.upstream_base(), CHATGPT_CODEX);
         a.credential_kind = Some(CredentialKind::ApiKey);
         assert_eq!(a.upstream_base(), OPENAI_API);
+    }
+
+    fn kimi(id: &str, wire: Provider, mode: AccountMode) -> AccountConfig {
+        let mut a = acc(
+            id,
+            mode,
+            (mode != AccountMode::Observed).then(|| env("K")).flatten(),
+        );
+        a.provider = wire;
+        a.vendor = Some(Vendor::KimiCom);
+        a.device_id = Some("0b9e7c1e-device".into());
+        a
+    }
+
+    #[test]
+    fn vendor_defaults_keep_old_configs_byte_identical() {
+        let a = acc("a", AccountMode::Observed, None);
+        assert_eq!(a.vendor(), Vendor::Anthropic);
+        let text = toml::to_string(&a).unwrap();
+        assert!(!text.contains("vendor") && !text.contains("device_id"));
+    }
+
+    #[test]
+    fn vendor_catalog_bases_per_wire() {
+        let mut k = kimi("k", Provider::Anthropic, AccountMode::Pooled);
+        assert_eq!(k.upstream_base(), "https://api.kimi.com/coding");
+        k.provider = Provider::Openai;
+        assert_eq!(k.upstream_base(), "https://api.kimi.com/coding/v1");
+        k.vendor = Some(Vendor::KimiAi);
+        assert_eq!(k.upstream_base(), "https://api.kimi.ai/coding/v1");
+        let mut x = acc("x", AccountMode::Key, env("X"));
+        x.provider = Provider::Openai;
+        x.vendor = Some(Vendor::Xai);
+        assert_eq!(x.upstream_base(), XAI_API);
+        x.vendor = Some(Vendor::Meta);
+        assert_eq!(x.upstream_base(), META_API);
+        // Catalog origins need no allow-list entry for their own vendor.
+        let c = Config {
+            accounts: vec![kimi("k", Provider::Anthropic, AccountMode::Pooled), x],
+            ..Default::default()
+        };
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
+    fn vendor_must_serve_wire_and_credential() {
+        let mut x = acc("x", AccountMode::Pooled, env("X"));
+        x.vendor = Some(Vendor::Xai); // xAI has no Messages route.
+        let c = Config {
+            accounts: vec![x],
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let mut k = kimi("k", Provider::Openai, AccountMode::Key);
+        k.credential_kind = None;
+        let c = Config {
+            accounts: vec![k],
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        // An Anthropic account can't claim the OpenAI vendor.
+        let mut a = acc("a", AccountMode::Observed, None);
+        a.vendor = Some(Vendor::Openai);
+        let c = Config {
+            accounts: vec![a],
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn kimi_router_owned_needs_a_valid_device_id_only_kimi_has_one() {
+        let mut k = kimi("k", Provider::Anthropic, AccountMode::Pooled);
+        k.device_id = None;
+        let mut c = Config {
+            accounts: vec![k.clone()],
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        k.device_id = Some("bad id\r\n".into());
+        c.accounts = vec![k.clone()];
+        assert!(c.validate().is_err());
+        // Observed Kimi clients send their own device headers.
+        let mut o = kimi("o", Provider::Anthropic, AccountMode::Observed);
+        o.device_id = None;
+        c.accounts = vec![o];
+        assert_eq!(c.validate(), Ok(()));
+        let mut a = acc("a", AccountMode::Pooled, env("A"));
+        a.device_id = Some("dev".into());
+        c.accounts = vec![a];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn vendor_origins_are_strict_in_both_directions() {
+        // A new vendor can't be pointed at another remote origin, even one
+        // the user allow-listed, nor at another path on its own origin.
+        let mut k = kimi("k", Provider::Anthropic, AccountMode::Pooled);
+        k.upstream = Some("https://evil.example.com".into());
+        let mut c = Config {
+            accounts: vec![k.clone()],
+            ..Default::default()
+        };
+        c.upstreams.allowed.push("https://evil.example.com".into());
+        assert!(c.validate().is_err());
+        k.upstream = Some("https://api.kimi.com/other".into());
+        c.accounts = vec![k.clone()];
+        assert!(c.validate().is_err());
+        // Nor at another vendor's catalog origin.
+        k.upstream = Some(KIMI_AI_CODING.into());
+        c.accounts = vec![k.clone()];
+        assert!(c.validate().is_err());
+        // A first-party account can't reach a new vendor's origin even when
+        // it is allow-listed, so a Claude token never goes to Kimi.
+        let mut a = acc("a", AccountMode::Pooled, env("A"));
+        a.upstream = Some(KIMI_COM_CODING.into());
+        c.upstreams.allowed.push("https://api.kimi.com".into());
+        c.accounts = vec![a];
+        assert!(c.validate().is_err());
+        // Loopback only when allow-listed, as for first-party accounts.
+        k.upstream = Some("http://127.0.0.1:9000".into());
+        c.accounts = vec![k.clone()];
+        assert!(c.validate().is_err());
+        c.upstreams.allowed.push("http://127.0.0.1:9000".into());
+        assert_eq!(c.validate(), Ok(()));
+
+        // Spelling variants of another vendor's host stay blocked for a
+        // first-party account even when that exact spelling is allow-listed:
+        // explicit or other ports, trailing DNS dot, letter case, other
+        // hosts on the vendor's domain.
+        for (upstream, allowed) in [
+            (
+                "https://api.kimi.com:443/coding",
+                "https://api.kimi.com:443",
+            ),
+            ("https://api.kimi.com./coding", "https://api.kimi.com."),
+            ("https://API.Kimi.COM/coding", "https://API.Kimi.COM"),
+            (
+                "https://api.kimi.ai:8443/coding",
+                "https://api.kimi.ai:8443",
+            ),
+            ("https://api.x.ai:443/v1", "https://api.x.ai:443"),
+            ("https://api.x.ai./v1", "https://api.x.ai."),
+            ("https://api.meta.ai:443/v1", "https://api.meta.ai:443"),
+            ("https://graph.meta.ai/v1", "https://graph.meta.ai"),
+        ] {
+            let mut a = acc("a", AccountMode::Pooled, env("A"));
+            a.upstream = Some(upstream.into());
+            let mut c = Config {
+                accounts: vec![a],
+                ..Default::default()
+            };
+            c.upstreams.allowed.push(allowed.into());
+            assert!(c.validate().is_err(), "first-party → {upstream}");
+            // The new vendor itself also accepts only its exact catalog base.
+            let mut k = kimi("k", Provider::Anthropic, AccountMode::Pooled);
+            k.vendor = Some(Vendor::Xai);
+            k.provider = Provider::Openai;
+            k.device_id = None;
+            k.upstream = Some(upstream.into());
+            c.accounts = vec![k];
+            assert!(c.validate().is_err(), "vendor → {upstream}");
+        }
+        // Query, fragment, escapes and backslashes in the authority are
+        // refused outright, so no parser can disagree about the host.
+        for bad in [
+            "https://api.anthropic.com?.api.kimi.com",
+            "https://api.anthropic.com#.api.kimi.com",
+            "https://api.kimi%2ecom/coding",
+            "https://api.anthropic.com\\.api.kimi.com",
+            "https://api.anthropic.com\\@api.kimi.com",
+        ] {
+            assert_eq!(split_url(bad), None, "{bad}");
+            let mut a = acc("a", AccountMode::Pooled, env("A"));
+            a.upstream = Some(bad.into());
+            let mut c = Config {
+                accounts: vec![a],
+                ..Default::default()
+            };
+            c.upstreams.allowed.push(bad.into());
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        // Custom first-party gateways keep working where allow-listed, and
+        // the default port is the same origin as no port.
+        for (upstream, allowed) in [
+            (
+                "https://gateway.example.com:8443/anthropic",
+                "https://gateway.example.com:8443",
+            ),
+            ("https://api.anthropic.com:443", "https://api.anthropic.com"),
+            (
+                "https://Gateway.Example.com./claude",
+                "https://gateway.example.com",
+            ),
+        ] {
+            let mut a = acc("a", AccountMode::Pooled, env("A"));
+            a.upstream = Some(upstream.into());
+            let mut c = Config {
+                accounts: vec![a],
+                ..Default::default()
+            };
+            c.upstreams.allowed.push(allowed.into());
+            assert_eq!(c.validate(), Ok(()), "{upstream}");
+        }
     }
 
     #[test]

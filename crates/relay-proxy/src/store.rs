@@ -173,6 +173,8 @@ mod tests {
         AccountConfig {
             id: AccountId(id.into()),
             provider: Provider::Anthropic,
+            vendor: None,
+            device_id: None,
             label: "Personal".into(),
             mode: AccountMode::Observed,
             plan: Some("Max 20×".into()),

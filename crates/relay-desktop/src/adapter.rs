@@ -482,6 +482,7 @@ mod tests {
         AccountView {
             id: AccountId(id.into()),
             provider,
+            vendor: relay_core::model::Vendor::first_party(provider),
             label: id.to_string(),
             identifier: Some("d••@acme.co".into()),
             plan: Some(plan.into()),

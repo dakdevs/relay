@@ -49,6 +49,124 @@ impl fmt::Display for Provider {
     }
 }
 
+/// Who operates an account's upstream, separate from the wire protocol
+/// ([`Provider`]) it speaks. Kimi serves both wires; xAI and Meta serve
+/// Responses only. Routing never crosses vendors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Vendor {
+    /// Anthropic (Claude subscriptions and Console keys).
+    Anthropic,
+    /// OpenAI (ChatGPT/Codex logins and Platform keys).
+    Openai,
+    /// Kimi Code on kimi.com.
+    KimiCom,
+    /// Kimi Code on kimi.ai.
+    KimiAi,
+    /// xAI (Grok) public API.
+    Xai,
+    /// Meta AI API.
+    Meta,
+}
+
+impl Vendor {
+    /// All vendors, in display order.
+    pub const ALL: [Vendor; 6] = [
+        Vendor::Anthropic,
+        Vendor::Openai,
+        Vendor::KimiCom,
+        Vendor::KimiAi,
+        Vendor::Xai,
+        Vendor::Meta,
+    ];
+
+    /// Stable kebab-case key used in config, headers (`x-relay-vendor`) and
+    /// group keys. Also the auth engine's vendor id.
+    pub fn key(self) -> &'static str {
+        match self {
+            Vendor::Anthropic => "anthropic",
+            Vendor::Openai => "openai",
+            Vendor::KimiCom => "kimi-com",
+            Vendor::KimiAi => "kimi-ai",
+            Vendor::Xai => "xai",
+            Vendor::Meta => "meta",
+        }
+    }
+
+    /// Parses [`Vendor::key`].
+    pub fn from_key(key: &str) -> Option<Vendor> {
+        Vendor::ALL.into_iter().find(|v| v.key() == key.trim())
+    }
+
+    /// Human-readable vendor name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Vendor::Anthropic => "Anthropic",
+            Vendor::Openai => "OpenAI",
+            Vendor::KimiCom => "Kimi",
+            Vendor::KimiAi => "Kimi (kimi.ai)",
+            Vendor::Xai => "xAI",
+            Vendor::Meta => "Meta",
+        }
+    }
+
+    /// The vendor that owns `wire`; the default for accounts and requests
+    /// that name no vendor.
+    pub fn first_party(wire: Provider) -> Vendor {
+        match wire {
+            Provider::Anthropic => Vendor::Anthropic,
+            Provider::Openai => Vendor::Openai,
+        }
+    }
+
+    /// Whether this vendor owns a wire protocol.
+    pub fn is_first_party(self) -> bool {
+        matches!(self, Vendor::Anthropic | Vendor::Openai)
+    }
+
+    /// Wire protocols the vendor serves without translation.
+    pub fn wires(self) -> &'static [Provider] {
+        match self {
+            Vendor::Anthropic => &[Provider::Anthropic],
+            Vendor::Openai | Vendor::Xai | Vendor::Meta => &[Provider::Openai],
+            Vendor::KimiCom | Vendor::KimiAi => &[Provider::Anthropic, Provider::Openai],
+        }
+    }
+
+    /// Whether the vendor serves `wire`.
+    pub fn serves(self, wire: Provider) -> bool {
+        self.wires().contains(&wire)
+    }
+
+    /// Whether routing to this vendor has live proof. `false` means the
+    /// route follows the vendor's documented or observed shape but has not
+    /// been confirmed with a real account; never present it as working.
+    pub fn verified(self) -> bool {
+        self.is_first_party()
+    }
+
+    /// Whether the vendor accepts `kind` on Relay's routes. Kimi Code is a
+    /// subscription login only; its platform keys use another origin.
+    pub fn accepts(self, kind: CredentialKind) -> bool {
+        !matches!(
+            (self, kind),
+            (Vendor::KimiCom | Vendor::KimiAi, CredentialKind::ApiKey)
+        )
+    }
+
+    /// Whether router-owned accounts need a per-install device id that the
+    /// vendor bound at sign-in (Kimi's `X-Msh-Device-Id`).
+    pub fn needs_device_id(self) -> bool {
+        matches!(self, Vendor::KimiCom | Vendor::KimiAi)
+    }
+}
+
+impl fmt::Display for Vendor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
 /// How Relay treats an account. Set per account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -197,6 +315,32 @@ mod tests {
         assert!(!AccountId::is_valid("a b"));
         assert!(!AccountId::is_valid(""));
         assert!(!AccountId::is_valid(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn vendor_keys_round_trip_and_wires_are_exact() {
+        #[derive(Deserialize)]
+        struct W {
+            v: Vendor,
+        }
+        for v in Vendor::ALL {
+            assert_eq!(Vendor::from_key(v.key()), Some(v));
+            let w: W = toml::from_str(&format!("v = \"{}\"", v.key())).unwrap();
+            assert_eq!(w.v, v);
+        }
+        assert_eq!(Vendor::from_key("kimi"), None);
+        assert_eq!(Vendor::first_party(Provider::Anthropic), Vendor::Anthropic);
+        assert_eq!(Vendor::first_party(Provider::Openai), Vendor::Openai);
+        assert!(
+            Vendor::KimiAi.serves(Provider::Anthropic) && Vendor::KimiAi.serves(Provider::Openai)
+        );
+        assert!(!Vendor::Xai.serves(Provider::Anthropic));
+        assert!(!Vendor::Meta.serves(Provider::Anthropic));
+        assert!(!Vendor::Anthropic.serves(Provider::Openai));
+        // No live proof yet for the new vendors.
+        assert!(!Vendor::KimiCom.verified() && !Vendor::Xai.verified() && !Vendor::Meta.verified());
+        assert!(!Vendor::KimiCom.accepts(CredentialKind::ApiKey));
+        assert!(Vendor::Xai.accepts(CredentialKind::ApiKey));
     }
 
     #[test]

@@ -511,6 +511,7 @@ pub fn offline_accounts(accounts: &[AccountConfig]) -> Vec<AccountView> {
         .map(|a| AccountView {
             id: a.id.clone(),
             provider: a.provider,
+            vendor: a.vendor(),
             label: a.label.clone(),
             identifier: a.identifier.clone(),
             plan: a.plan.clone(),
@@ -588,6 +589,8 @@ mod tests {
         AccountConfig {
             id: AccountId(id.into()),
             provider,
+            vendor: None,
+            device_id: None,
             label: label.into(),
             mode,
             plan: Some("Max 20×".into()),

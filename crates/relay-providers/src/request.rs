@@ -4,7 +4,7 @@
 
 use http::HeaderMap;
 use memchr::memmem;
-use relay_core::model::Provider;
+use relay_core::model::{Provider, Vendor};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use std::borrow::Cow;
@@ -44,6 +44,27 @@ impl Endpoint {
             self,
             Endpoint::Messages | Endpoint::Responses | Endpoint::ResponsesCompact
         )
+    }
+
+    /// Whether `vendor` serves this endpoint on `wire`. First-party vendors
+    /// serve every endpoint of their wire. Others serve only what their
+    /// upstream is known to implement (CLIProxyAPI 3f0cef0): Kimi Code
+    /// Messages, token counting and Responses; xAI Responses and compact
+    /// (`api.x.ai`); Meta Responses (compact answers 501). No model listing
+    /// is known for them, so `/v1/models` is refused rather than guessed.
+    pub fn served_by(self, vendor: Vendor, wire: Provider) -> bool {
+        if !vendor.serves(wire) {
+            return false;
+        }
+        match vendor {
+            Vendor::Anthropic | Vendor::Openai => true,
+            Vendor::KimiCom | Vendor::KimiAi => matches!(
+                self,
+                Endpoint::Messages | Endpoint::CountTokens | Endpoint::Responses
+            ),
+            Vendor::Xai => matches!(self, Endpoint::Responses | Endpoint::ResponsesCompact),
+            Vendor::Meta => self == Endpoint::Responses,
+        }
     }
 
     /// Upstream path suffix appended to the account's base URL. Anthropic
@@ -264,6 +285,25 @@ mod tests {
             "/v1/models"
         );
         assert!(Endpoint::from_path("/v0/management/api-call").is_none());
+    }
+
+    #[test]
+    fn vendor_endpoints_follow_known_upstream_routes() {
+        use Endpoint::*;
+        for e in [Messages, CountTokens, Models] {
+            assert!(e.served_by(Vendor::Anthropic, Provider::Anthropic));
+        }
+        assert!(Messages.served_by(Vendor::KimiCom, Provider::Anthropic));
+        assert!(CountTokens.served_by(Vendor::KimiAi, Provider::Anthropic));
+        assert!(Responses.served_by(Vendor::KimiCom, Provider::Openai));
+        assert!(!ResponsesCompact.served_by(Vendor::KimiCom, Provider::Openai));
+        assert!(!Models.served_by(Vendor::KimiCom, Provider::Anthropic));
+        assert!(ResponsesCompact.served_by(Vendor::Xai, Provider::Openai));
+        assert!(!ResponsesCompact.served_by(Vendor::Meta, Provider::Openai));
+        assert!(Responses.served_by(Vendor::Meta, Provider::Openai));
+        // A vendor never serves a wire it doesn't speak.
+        assert!(!Messages.served_by(Vendor::Xai, Provider::Anthropic));
+        assert!(!Messages.served_by(Vendor::Openai, Provider::Anthropic));
     }
 
     #[test]

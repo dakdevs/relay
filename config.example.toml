@@ -72,3 +72,29 @@ credential = { env = "RELAY_OPENAI_KEY" }
 # label = "Work"
 # mode = "pooled"
 # credential = { keychain_service = "relay", keychain_account = "claude-work", format = "claude-credentials-json" }
+
+# Other vendors on the same wires. Unverified: routing passes local mock
+# tests only, so none is enabled here. `provider` is the wire; `vendor`
+# picks the operator. Clients select them with `x-relay-vendor: <vendor>`;
+# without that header requests go to Anthropic or OpenAI only. The upstream
+# is fixed per vendor (see integration-contract.md, Vendors); leave it unset.
+#
+# Kimi Code: sign-in only (no API keys). Router-owned accounts need the
+# device id the sign-in used (an identifier, not a secret).
+# [[accounts]]
+# id = "kimi-work"
+# provider = "anthropic"     # or "openai" for /v1/responses
+# vendor = "kimi-com"        # or "kimi-ai"
+# label = "Kimi"
+# mode = "pooled"
+# device_id = "<device id from sign-in>"
+# credential = { keychain_service = "relay", keychain_account = "kimi-work" }
+#
+# xAI or Meta API key (Responses only).
+# [[accounts]]
+# id = "xai-key"
+# provider = "openai"
+# vendor = "xai"             # or "meta"
+# label = "xAI"
+# mode = "key"
+# credential = { env = "RELAY_XAI_KEY" }

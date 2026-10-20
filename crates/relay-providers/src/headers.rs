@@ -15,6 +15,9 @@ pub const RELAY_KEY: &str = "x-relay-key";
 pub const RELAY_ACCOUNT: &str = "x-relay-account";
 /// Chooses the pool (`pooled` or `key`) for router-owned requests.
 pub const RELAY_POOL: &str = "x-relay-pool";
+/// Chooses the vendor (`kimi-com`, `xai`, …) for a request. Absent means
+/// the wire's first-party vendor. A local routing hint; never forwarded.
+pub const RELAY_VENDOR: &str = "x-relay-vendor";
 /// Explicit session id (overrides provider session headers).
 pub const RELAY_SESSION: &str = "x-relay-session";
 
@@ -79,6 +82,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-relay-key", "k".parse().unwrap());
         h.insert("x-relay-account", "a".parse().unwrap());
+        h.insert(RELAY_VENDOR, "kimi-com".parse().unwrap());
         h.insert(header::CONNECTION, "keep-alive, x-foo".parse().unwrap());
         h.insert("x-foo", "1".parse().unwrap());
         h.insert(header::HOST, "127.0.0.1".parse().unwrap());

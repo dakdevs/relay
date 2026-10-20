@@ -535,6 +535,8 @@ pub fn account_config(
     Ok(AccountConfig {
         id: AccountId(id),
         provider,
+        vendor: None,
+        device_id: None,
         label: label.to_string(),
         mode,
         plan: None,

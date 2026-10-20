@@ -3,7 +3,7 @@
 
 use crate::UnixMs;
 use crate::aggregate::{WindowAggregate, aggregate_window, window_keys};
-use crate::model::{AccountId, AccountMode, CredentialKind, Provider};
+use crate::model::{AccountId, AccountMode, CredentialKind, Provider, Vendor};
 use crate::quota::{Credits, Freshness, LOW_LEFT_PCT, QuotaWindow};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -17,7 +17,8 @@ pub struct Snapshot {
     pub generated_at: UnixMs,
     /// Listener and routing state.
     pub routing: RoutingStatus,
-    /// Providers that have at least one account, in [`Provider::ALL`] order.
+    /// One section per wire and vendor with at least one account, in
+    /// [`Provider::ALL`] then [`Vendor::ALL`] order.
     pub providers: Vec<ProviderView>,
     /// Usage events dropped because the recorder queue was full.
     pub telemetry_dropped: u64,
@@ -50,20 +51,27 @@ pub enum RoutingStatus {
     },
 }
 
-/// One provider section.
+/// One section: a wire protocol served by one vendor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderView {
-    /// Provider.
+    /// Wire protocol.
     pub provider: Provider,
+    /// Vendor of every account in the section; brand the section with it.
+    pub vendor: Vendor,
     /// Groups (plan + credential kind), in first-configured order.
     pub groups: Vec<GroupView>,
 }
 
-/// Accounts with the same provider, plan and credential kind.
+/// Accounts with the same wire, vendor, plan and credential kind. Vendors
+/// are never combined, even when everything else matches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupView {
-    /// Stable key `provider:plan:credential`, for UI expand state.
+    /// Stable key, for UI expand state: `provider:plan:credential` for
+    /// first-party vendors (unchanged from before vendors existed), else
+    /// `provider:vendor:plan:credential`.
     pub key: String,
+    /// Vendor of every account in the group.
+    pub vendor: Vendor,
     /// Plan label; `None` when unknown.
     pub plan: Option<String>,
     /// Credential kind.
@@ -120,18 +128,24 @@ impl Capabilities {
     /// documented provider API for subscriptions, so both are unsupported
     /// with the reason instead of being faked.
     pub fn for_account(provider: Provider, credential: CredentialKind) -> Capabilities {
-        let refresh = match credential {
-            CredentialKind::ApiKey => {
+        Capabilities::for_vendor(Vendor::first_party(provider), credential)
+    }
+
+    /// [`Capabilities::for_account`] for any vendor. Relay reads no quota
+    /// signal from non-first-party vendors, so their quota stays "not
+    /// reported".
+    pub fn for_vendor(vendor: Vendor, credential: CredentialKind) -> Capabilities {
+        let refresh = match (vendor, credential) {
+            (v, _) if !v.is_first_party() => {
+                "This provider reports no usage Relay can read; quota shows as not reported"
+            }
+            (_, CredentialKind::ApiKey) => {
                 "API rate limits arrive with each response; no separate read exists"
             }
-            CredentialKind::Subscription => match provider {
-                Provider::Anthropic => {
-                    "No documented usage read for Claude subscriptions; values update with traffic"
-                }
-                Provider::Openai => {
-                    "No documented usage read for ChatGPT plans; values update with traffic"
-                }
-            },
+            (Vendor::Anthropic, _) => {
+                "No documented usage read for Claude subscriptions; values update with traffic"
+            }
+            _ => "No documented usage read for ChatGPT plans; values update with traffic",
         };
         Capabilities {
             reset_limits: Capability::Unsupported(
@@ -147,8 +161,11 @@ impl Capabilities {
 pub struct AccountView {
     /// Config id.
     pub id: AccountId,
-    /// Provider.
+    /// Wire protocol.
     pub provider: Provider,
+    /// Vendor operating the upstream; brand the account with this, not
+    /// with `provider`.
+    pub vendor: Vendor,
     /// Display label.
     pub label: String,
     /// Masked identifier.
@@ -232,42 +249,55 @@ pub fn account_state(windows: &[QuotaWindow], inputs: StateInputs, now: UnixMs) 
     }
 }
 
-/// Groups accounts by provider, then plan and credential kind, and computes
+/// Groups accounts by provider, then vendor, plan and credential kind, and computes
 /// window aggregates. Accounts keep their input order.
 pub fn group_accounts(accounts: Vec<AccountView>, now: UnixMs) -> Vec<ProviderView> {
     let mut providers: Vec<ProviderView> = Vec::new();
     for provider in Provider::ALL {
-        let mut groups: Vec<GroupView> = Vec::new();
-        for acc in accounts.iter().filter(|a| a.provider == provider) {
-            let key = format!(
-                "{}:{}:{}",
-                provider.key(),
-                acc.plan.as_deref().unwrap_or("-"),
-                match acc.credential {
+        for vendor in Vendor::ALL {
+            let mut groups: Vec<GroupView> = Vec::new();
+            for acc in accounts
+                .iter()
+                .filter(|a| a.provider == provider && a.vendor == vendor)
+            {
+                let plan = acc.plan.as_deref().unwrap_or("-");
+                let credential = match acc.credential {
                     CredentialKind::Subscription => "subscription",
                     CredentialKind::ApiKey => "api-key",
+                };
+                let key = if vendor.is_first_party() {
+                    format!("{}:{plan}:{credential}", provider.key())
+                } else {
+                    format!("{}:{}:{plan}:{credential}", provider.key(), vendor.key())
+                };
+                match groups.iter_mut().find(|g| g.key == key) {
+                    Some(g) => g.accounts.push(acc.clone()),
+                    None => groups.push(GroupView {
+                        key,
+                        vendor,
+                        plan: acc.plan.clone(),
+                        credential: acc.credential,
+                        windows: Vec::new(),
+                        accounts: vec![acc.clone()],
+                    }),
                 }
-            );
-            match groups.iter_mut().find(|g| g.key == key) {
-                Some(g) => g.accounts.push(acc.clone()),
-                None => groups.push(GroupView {
-                    key,
-                    plan: acc.plan.clone(),
-                    credential: acc.credential,
-                    windows: Vec::new(),
-                    accounts: vec![acc.clone()],
-                }),
             }
-        }
-        for g in &mut groups {
-            let keys = window_keys(g.accounts.iter().map(|a| a.windows.as_slice()));
-            g.windows = keys
-                .iter()
-                .map(|k| aggregate_window(k, g.accounts.iter().map(|a| a.windows.as_slice()), now))
-                .collect();
-        }
-        if !groups.is_empty() {
-            providers.push(ProviderView { provider, groups });
+            for g in &mut groups {
+                let keys = window_keys(g.accounts.iter().map(|a| a.windows.as_slice()));
+                g.windows = keys
+                    .iter()
+                    .map(|k| {
+                        aggregate_window(k, g.accounts.iter().map(|a| a.windows.as_slice()), now)
+                    })
+                    .collect();
+            }
+            if !groups.is_empty() {
+                providers.push(ProviderView {
+                    provider,
+                    vendor,
+                    groups,
+                });
+            }
         }
     }
     providers
@@ -281,6 +311,7 @@ mod tests {
         AccountView {
             id: AccountId(id.into()),
             provider,
+            vendor: Vendor::first_party(provider),
             label: id.into(),
             identifier: None,
             plan: plan.map(Into::into),
@@ -330,6 +361,47 @@ mod tests {
         assert_eq!(max.windows[0].avg_left_pct, Some(60.0));
         assert!(out[0].groups[1].windows.is_empty());
         assert_eq!(out[1].groups[0].windows[0].avg_left_pct, Some(90.0));
+    }
+
+    #[test]
+    fn vendors_are_never_combined_even_with_matching_wire_plan_and_credential() {
+        let mut kimi = view("k", Provider::Anthropic, Some("Max"), Some(90.0));
+        kimi.vendor = Vendor::KimiCom;
+        let out = group_accounts(
+            vec![
+                view("b", Provider::Anthropic, Some("Max"), Some(20.0)),
+                kimi,
+            ],
+            0,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            (out[0].provider, out[0].vendor),
+            (Provider::Anthropic, Vendor::Anthropic)
+        );
+        assert_eq!(
+            (out[1].provider, out[1].vendor),
+            (Provider::Anthropic, Vendor::KimiCom)
+        );
+        // First-party keys are unchanged so saved expand state survives.
+        assert_eq!(out[0].groups[0].key, "anthropic:Max:subscription");
+        assert_eq!(out[1].groups[0].key, "anthropic:kimi-com:Max:subscription");
+        assert_eq!(out[1].groups[0].vendor, Vendor::KimiCom);
+        // Each aggregate is its own vendor's only: 80 % and 10 % left, not 45 %.
+        assert_eq!(out[0].groups[0].windows[0].avg_left_pct, Some(80.0));
+        assert_eq!(out[1].groups[0].windows[0].avg_left_pct, Some(10.0));
+    }
+
+    #[test]
+    fn non_first_party_quota_is_described_as_not_reported() {
+        let c = Capabilities::for_vendor(Vendor::Xai, CredentialKind::ApiKey);
+        assert!(
+            matches!(c.refresh_quota, Capability::Unsupported(r) if r.contains("not reported"))
+        );
+        assert_eq!(
+            Capabilities::for_account(Provider::Openai, CredentialKind::ApiKey),
+            Capabilities::for_vendor(Vendor::Openai, CredentialKind::ApiKey)
+        );
     }
 
     #[test]

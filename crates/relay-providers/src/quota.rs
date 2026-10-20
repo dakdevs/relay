@@ -4,7 +4,7 @@
 
 use http::HeaderMap;
 use relay_core::UnixMs;
-use relay_core::model::Provider;
+use relay_core::model::{Provider, Vendor};
 use relay_core::quota::{Credits, QuotaUpdate, QuotaWindow};
 
 fn get<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -268,6 +268,20 @@ pub fn parse(provider: Provider, h: &HeaderMap, now: UnixMs) -> QuotaUpdate {
     out
 }
 
+/// [`parse`] for any vendor. Header names above are first-party
+/// observations; another vendor reusing a name could mean something else,
+/// so only the standard `retry-after` is read and windows stay "not
+/// reported".
+pub fn parse_for(vendor: Vendor, wire: Provider, h: &HeaderMap, now: UnixMs) -> QuotaUpdate {
+    if vendor.is_first_party() {
+        return parse(wire, h, now);
+    }
+    QuotaUpdate {
+        retry_after_ms: retry_after_ms(h),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +431,32 @@ mod tests {
         assert_eq!(
             retry_after_ms(&headers(&[("retry-after", "Wed, 21 Oct 2015")])),
             None
+        );
+    }
+
+    #[test]
+    fn other_vendors_report_no_windows_even_with_first_party_header_names() {
+        let h = headers(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
+            ("x-codex-primary-used-percent", "40"),
+            ("x-ratelimit-limit-requests", "100"),
+            ("x-ratelimit-remaining-requests", "10"),
+            ("retry-after", "7"),
+        ]);
+        for (v, w) in [
+            (Vendor::KimiCom, Provider::Anthropic),
+            (Vendor::KimiAi, Provider::Openai),
+            (Vendor::Xai, Provider::Openai),
+            (Vendor::Meta, Provider::Openai),
+        ] {
+            let u = parse_for(v, w, &h, 0);
+            assert!(u.windows.is_empty() && u.credits.is_none(), "{v}");
+            assert_eq!(u.retry_after_ms, Some(7_000));
+        }
+        assert!(
+            !parse_for(Vendor::Anthropic, Provider::Anthropic, &h, 0)
+                .windows
+                .is_empty()
         );
     }
 }

@@ -8,7 +8,7 @@ use crate::secrets::{self, Unavailable};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use relay_core::UnixMs;
 use relay_core::config::{AccountConfig, Config};
-use relay_core::model::{AccountId, Pool, Provider};
+use relay_core::model::{AccountId, Pool, Provider, Vendor};
 use relay_core::quota::{QuotaState, QuotaUpdate};
 use relay_core::select::Candidate;
 use relay_core::snapshot::{
@@ -119,8 +119,12 @@ impl AccountRt {
 
     /// Carries runtime knowledge into a new config for the same account.
     fn carry(prev: &AccountRt, cfg: AccountConfig) -> AccountRt {
-        let same_credential =
-            prev.cfg.credential == cfg.credential && prev.cfg.provider == cfg.provider;
+        // A credential is bound to its destination: a vendor, wire or
+        // device change reloads it rather than carrying it across.
+        let same_credential = prev.cfg.credential == cfg.credential
+            && prev.cfg.provider == cfg.provider
+            && prev.cfg.vendor() == cfg.vendor()
+            && prev.cfg.device_id == cfg.device_id;
         let mut next = AccountRt::new(cfg);
         if prev.cfg.max_in_flight == next.cfg.max_in_flight {
             // Keep the semaphore so in-flight permits stay counted.
@@ -403,6 +407,7 @@ impl AccountRt {
         AccountView {
             id: self.cfg.id.clone(),
             provider: self.cfg.provider,
+            vendor: self.cfg.vendor(),
             label: self.cfg.label.clone(),
             identifier: self.cfg.identifier.clone(),
             plan: q.plan.clone().or_else(|| self.cfg.plan.clone()),
@@ -422,7 +427,7 @@ impl AccountRt {
             cooldown_until: (cooldown > now).then_some(cooldown),
             models_seen: lock(&self.models_seen).iter().cloned().collect(),
             models_allowed: self.cfg.models.clone(),
-            capabilities: Capabilities::for_account(self.cfg.provider, self.cfg.credential_kind()),
+            capabilities: Capabilities::for_vendor(self.cfg.vendor(), self.cfg.credential_kind()),
         }
     }
 }
@@ -460,11 +465,17 @@ impl Registry {
         self.accounts.iter().find(|a| a.cfg.id.as_str() == id)
     }
 
-    /// Router-owned accounts of a provider in a pool.
-    pub fn pool(&self, provider: Provider, pool: Pool) -> impl Iterator<Item = &Arc<AccountRt>> {
-        self.accounts
-            .iter()
-            .filter(move |a| a.cfg.provider == provider && a.cfg.mode == pool.mode())
+    /// Router-owned accounts of one wire and vendor in a pool. Vendors
+    /// never share a pool.
+    pub fn pool(
+        &self,
+        provider: Provider,
+        vendor: Vendor,
+        pool: Pool,
+    ) -> impl Iterator<Item = &Arc<AccountRt>> {
+        self.accounts.iter().filter(move |a| {
+            a.cfg.provider == provider && a.cfg.vendor() == vendor && a.cfg.mode == pool.mode()
+        })
     }
 }
 
@@ -475,13 +486,16 @@ struct Binding {
     last: Instant,
 }
 
+/// A session id scoped by wire and vendor.
+type SessionKey = (Provider, Vendor, String);
+
 const SHARDS: usize = 16;
 /// Upper bound on remembered sessions.
 pub const MAX_SESSIONS: usize = 50_000;
 
 /// Sharded session map with TTL.
 pub struct Sessions {
-    shards: [Mutex<HashMap<(Provider, String), Binding>>; SHARDS],
+    shards: [Mutex<HashMap<SessionKey, Binding>>; SHARDS],
     len: AtomicUsize,
 }
 
@@ -495,7 +509,7 @@ impl Default for Sessions {
 }
 
 impl Sessions {
-    fn shard(&self, id: &str) -> &Mutex<HashMap<(Provider, String), Binding>> {
+    fn shard(&self, id: &str) -> &Mutex<HashMap<SessionKey, Binding>> {
         // FNV-1a; cheap and stable.
         let h = id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
@@ -504,9 +518,17 @@ impl Sessions {
     }
 
     /// Bound account, refreshing its last-use time, if within `ttl`.
-    pub fn get(&self, provider: Provider, id: &str, ttl: Duration) -> Option<AccountId> {
+    /// Sessions are scoped by wire and vendor, so the same client session id
+    /// on another vendor never resolves to this binding.
+    pub fn get(
+        &self,
+        provider: Provider,
+        vendor: Vendor,
+        id: &str,
+        ttl: Duration,
+    ) -> Option<AccountId> {
         let mut m = lock(self.shard(id));
-        let key = (provider, id.to_string());
+        let key = (provider, vendor, id.to_string());
         match m.get_mut(&key) {
             Some(b) if b.last.elapsed() <= ttl => {
                 b.last = Instant::now();
@@ -522,9 +544,9 @@ impl Sessions {
     }
 
     /// Binds a session. Ignored when the map is full of live sessions.
-    pub fn bind(&self, provider: Provider, id: &str, account: &AccountId) {
+    pub fn bind(&self, provider: Provider, vendor: Vendor, id: &str, account: &AccountId) {
         let mut m = lock(self.shard(id));
-        let key = (provider, id.to_string());
+        let key = (provider, vendor, id.to_string());
         if let Some(b) = m.get_mut(&key) {
             b.account = account.clone();
             b.last = Instant::now();
@@ -640,6 +662,8 @@ mod tests {
         AccountConfig {
             id: AccountId(id.into()),
             provider: Provider::Anthropic,
+            vendor: None,
+            device_id: None,
             label: id.into(),
             mode: AccountMode::Observed,
             plan: None,
@@ -764,13 +788,16 @@ mod tests {
     fn sessions_bind_expire_and_count() {
         let s = Sessions::default();
         let a = AccountId("a".into());
-        s.bind(Provider::Anthropic, "s1", &a);
-        s.bind(Provider::Anthropic, "s2", &a);
+        let ttl = Duration::from_secs(60);
+        s.bind(Provider::Anthropic, Vendor::Anthropic, "s1", &a);
+        s.bind(Provider::Anthropic, Vendor::Anthropic, "s2", &a);
         assert_eq!(
-            s.get(Provider::Anthropic, "s1", Duration::from_secs(60)),
+            s.get(Provider::Anthropic, Vendor::Anthropic, "s1", ttl),
             Some(a.clone())
         );
-        assert_eq!(s.get(Provider::Openai, "s1", Duration::from_secs(60)), None);
+        assert_eq!(s.get(Provider::Openai, Vendor::Openai, "s1", ttl), None);
+        // Same wire and session id, other vendor: no binding.
+        assert_eq!(s.get(Provider::Anthropic, Vendor::KimiCom, "s1", ttl), None);
         assert_eq!(s.sweep(Duration::from_secs(60)).get(&a), Some(&2));
         assert_eq!(s.sweep(Duration::ZERO).get(&a), None);
         assert_eq!(s.len.load(Ordering::Relaxed), 0);

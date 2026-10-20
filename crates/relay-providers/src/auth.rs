@@ -6,7 +6,7 @@
 
 use http::{HeaderMap, HeaderValue, header};
 use relay_core::config::SecretFormat;
-use relay_core::model::{CredentialKind, Provider};
+use relay_core::model::{CredentialKind, Provider, Vendor};
 use std::fmt;
 
 /// A secret string. `Debug` and `Display` never print it.
@@ -183,6 +183,74 @@ pub fn inject(
     Ok(())
 }
 
+/// Kimi client headers. Relay names itself honestly instead of copying a
+/// Kimi CLI's identity.
+const KIMI_PLATFORM: &str = "Relay";
+
+/// [`inject`] for any vendor. First-party vendors behave exactly as
+/// [`inject`]. Other vendors get only `Authorization: Bearer`, plus Kimi's
+/// `X-Msh-*` headers naming Relay and the device id bound at sign-in
+/// (required: without it nothing is sent). Client `oauth-*` Anthropic betas
+/// are dropped; other betas pass. No vendor CLI identity (user agent,
+/// client id, version) is ever synthesised.
+pub fn inject_for(
+    vendor: Vendor,
+    wire: Provider,
+    kind: CredentialKind,
+    device_id: Option<&str>,
+    headers: &mut HeaderMap,
+    cred: &Credential,
+) -> Result<(), ParseError> {
+    if vendor.is_first_party() {
+        return inject(wire, kind, headers, cred);
+    }
+    headers.remove(header::AUTHORIZATION);
+    headers.remove("x-api-key");
+    headers.remove("chatgpt-account-id");
+    let msh: Vec<_> = headers
+        .keys()
+        .filter(|k| k.as_str().starts_with("x-msh-"))
+        .cloned()
+        .collect();
+    for k in msh {
+        headers.remove(k);
+    }
+    // `oauth-*` betas declare a Claude login capability that means nothing
+    // to another vendor; other betas still describe the request.
+    let betas: Vec<String> = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .flat_map(|v| v.to_str().unwrap_or("").split(','))
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && !b.starts_with("oauth-"))
+        .map(str::to_string)
+        .collect();
+    headers.remove("anthropic-beta");
+    if !betas.is_empty() {
+        let v = HeaderValue::try_from(betas.join(","))
+            .map_err(|_| ParseError("anthropic-beta is not a valid header value"))?;
+        headers.insert("anthropic-beta", v);
+    }
+    let mut v = HeaderValue::try_from(format!("Bearer {}", cred.token.expose()))
+        .map_err(|_| ParseError("credential is not a valid header value"))?;
+    v.set_sensitive(true);
+    headers.insert(header::AUTHORIZATION, v);
+    if vendor.needs_device_id() {
+        let id = device_id
+            .filter(|d| !d.is_empty())
+            .ok_or(ParseError("the account has no device id from its sign-in"))?;
+        let id = HeaderValue::try_from(id)
+            .map_err(|_| ParseError("device id is not a valid header value"))?;
+        headers.insert("x-msh-platform", HeaderValue::from_static(KIMI_PLATFORM));
+        headers.insert(
+            "x-msh-version",
+            HeaderValue::from_static(relay_core::DISPLAY_VERSION),
+        );
+        headers.insert("x-msh-device-id", id);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +376,128 @@ mod tests {
         )
         .unwrap();
         assert_eq!(h["anthropic-beta"], "oauth-2025-04-20");
+    }
+
+    #[test]
+    fn other_vendors_get_bearer_only_and_never_first_party_extras() {
+        for (vendor, wire) in [
+            (Vendor::Xai, Provider::Openai),
+            (Vendor::Meta, Provider::Openai),
+            (Vendor::KimiCom, Provider::Anthropic),
+            (Vendor::KimiAi, Provider::Openai),
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(header::AUTHORIZATION, "Bearer local-key".parse().unwrap());
+            h.insert("x-api-key", "local-key".parse().unwrap());
+            h.insert("chatgpt-account-id", "stale".parse().unwrap());
+            h.insert("x-msh-platform", "kimi_cli".parse().unwrap());
+            h.insert(header::USER_AGENT, "codex_cli_rs/1".parse().unwrap());
+            inject_for(
+                vendor,
+                wire,
+                CredentialKind::Subscription,
+                Some("dev-1"),
+                &mut h,
+                &cred("vt"),
+            )
+            .unwrap();
+            assert_eq!(h[header::AUTHORIZATION], "Bearer vt", "{vendor}");
+            assert!(h[header::AUTHORIZATION].is_sensitive());
+            assert!(h.get("x-api-key").is_none());
+            // The Codex account id belongs to ChatGPT; never sent elsewhere.
+            assert!(h.get("chatgpt-account-id").is_none());
+            assert!(h.get("anthropic-beta").is_none());
+            // The client's own user agent passes; Relay adds none.
+            assert_eq!(h[header::USER_AGENT], "codex_cli_rs/1");
+            if vendor.needs_device_id() {
+                assert_eq!(h["x-msh-platform"], "Relay");
+                assert_eq!(h["x-msh-version"], relay_core::DISPLAY_VERSION);
+                assert_eq!(h["x-msh-device-id"], "dev-1");
+            } else {
+                assert!(h.keys().all(|k| !k.as_str().starts_with("x-msh-")));
+            }
+        }
+    }
+
+    #[test]
+    fn other_vendors_drop_claude_oauth_betas_and_keep_the_rest() {
+        let mut h = HeaderMap::new();
+        h.append(
+            "anthropic-beta",
+            "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"
+                .parse()
+                .unwrap(),
+        );
+        h.append(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14".parse().unwrap(),
+        );
+        inject_for(
+            Vendor::KimiCom,
+            Provider::Anthropic,
+            CredentialKind::Subscription,
+            Some("dev-1"),
+            &mut h,
+            &cred("vt"),
+        )
+        .unwrap();
+        let all: Vec<&str> = h
+            .get_all("anthropic-beta")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            all,
+            ["fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14"]
+        );
+        let mut h = HeaderMap::new();
+        h.insert("anthropic-beta", "oauth-2025-04-20".parse().unwrap());
+        inject_for(
+            Vendor::KimiAi,
+            Provider::Anthropic,
+            CredentialKind::Subscription,
+            Some("dev-1"),
+            &mut h,
+            &cred("vt"),
+        )
+        .unwrap();
+        assert!(h.get("anthropic-beta").is_none());
+    }
+
+    #[test]
+    fn kimi_without_device_id_is_refused() {
+        let mut h = HeaderMap::new();
+        let e = inject_for(
+            Vendor::KimiCom,
+            Provider::Anthropic,
+            CredentialKind::Subscription,
+            None,
+            &mut h,
+            &cred("vt"),
+        );
+        assert!(e.is_err());
+    }
+
+    #[test]
+    fn first_party_vendor_matches_inject() {
+        let mut a = HeaderMap::new();
+        let mut b = HeaderMap::new();
+        inject(
+            Provider::Openai,
+            CredentialKind::Subscription,
+            &mut a,
+            &cred("at"),
+        )
+        .unwrap();
+        inject_for(
+            Vendor::Openai,
+            Provider::Openai,
+            CredentialKind::Subscription,
+            None,
+            &mut b,
+            &cred("at"),
+        )
+        .unwrap();
+        assert_eq!(a, b);
     }
 }

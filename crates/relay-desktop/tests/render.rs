@@ -70,6 +70,7 @@ fn acc(
     AccountView {
         id: AccountId(id.into()),
         provider,
+        vendor: relay_core::model::Vendor::first_party(provider),
         label: label.into(),
         identifier: Some(who.into()),
         plan: Some(plan.into()),

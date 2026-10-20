@@ -371,6 +371,8 @@ mod tests {
         let existing = AccountConfig {
             id: AccountId("openai-dev".into()),
             provider: Provider::Openai,
+            vendor: None,
+            device_id: None,
             label: "Dev".into(),
             mode: AccountMode::Observed,
             plan: Some("Plus".into()),

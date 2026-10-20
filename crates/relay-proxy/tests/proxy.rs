@@ -11,7 +11,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use mock::{Act, Mock};
 use relay_core::config::{AccountConfig, Config, SecretFormat, SecretRef};
-use relay_core::model::{AccountId, AccountMode, CredentialKind, Pool, Provider};
+use relay_core::model::{AccountId, AccountMode, CredentialKind, Pool, Provider, Vendor};
 use relay_core::select::Strategy;
 use relay_core::snapshot::{AccountState, RoutingStatus};
 use relay_proxy::paths::Paths;
@@ -40,6 +40,8 @@ fn account(id: &str, provider: Provider, mode: AccountMode, upstream: &str) -> A
     AccountConfig {
         id: AccountId(id.into()),
         provider,
+        vendor: None,
+        device_id: None,
         label: id.into(),
         mode,
         plan: None,
@@ -1329,4 +1331,372 @@ async fn second_account_after_failover_still_reloads_on_401() {
     assert_eq!(r.status, 200);
     assert_eq!(b.count(), 2);
     assert_eq!(b.seen()[1].header("authorization"), Some("Bearer token-b2"));
+}
+
+// ---- Vendors that share a wire: Kimi, xAI, Meta ----
+
+fn vendor_account(
+    id: &str,
+    provider: Provider,
+    vendor: Vendor,
+    mode: AccountMode,
+    upstream: &str,
+) -> AccountConfig {
+    let mut a = account(id, provider, mode, upstream);
+    a.vendor = Some(vendor);
+    if vendor.needs_device_id() {
+        a.device_id = Some(format!("device-{id}"));
+    }
+    a
+}
+
+const CLAUDE_BODY: &str =
+    r#"{"model":"kimi-k2","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+fn assert_no_relay_headers(s: &mock::Seen) {
+    assert!(
+        s.headers
+            .iter()
+            .all(|(k, _)| !k.to_ascii_lowercase().starts_with("x-relay-")),
+        "relay headers leaked: {:?}",
+        s.headers.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kimi_serves_both_wires_with_its_paths_and_honest_headers() {
+    // Kimi answers with first-party-looking quota headers; they must not be
+    // read as Kimi quota.
+    let up = Mock::start(
+        Act::sse(vec![CLAUDE_SSE])
+            .with_header("anthropic-ratelimit-unified-5h-utilization", "0.25")
+            .with_header("anthropic-ratelimit-unified-5h-reset", "4102444800"),
+    )
+    .await;
+    let env = proxy(
+        vec![
+            vendor_account(
+                "kimi-msg",
+                Provider::Anthropic,
+                Vendor::KimiCom,
+                AccountMode::Pooled,
+                &format!("{}/coding", up.url()),
+            ),
+            vendor_account(
+                "kimi-resp",
+                Provider::Openai,
+                Vendor::KimiCom,
+                AccountMode::Pooled,
+                &format!("{}/coding/v1", up.url()),
+            ),
+        ],
+        |_| {},
+    );
+    let c = client();
+    let kimi = [
+        ("x-relay-vendor", "kimi-com"),
+        ("anthropic-version", "2023-06-01"),
+    ];
+    let r = send_owned(&c, &env, "/v1/messages?beta=true", &kimi, CLAUDE_BODY).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, CLAUDE_SSE, "stream bytes unchanged");
+    let r = send_owned(&c, &env, "/v1/messages/count_tokens", &kimi, CLAUDE_BODY).await;
+    assert_eq!(r.status, 200);
+    let r = send_owned(&c, &env, "/v1/responses", &kimi[..1], FIRST_TURN).await;
+    assert_eq!(r.status, 200);
+    let seen = up.seen();
+    assert_eq!(
+        seen.iter().map(|s| s.path.as_str()).collect::<Vec<_>>(),
+        [
+            "/coding/v1/messages?beta=true",
+            "/coding/v1/messages/count_tokens",
+            "/coding/v1/responses"
+        ]
+    );
+    for (s, id) in seen.iter().zip(["kimi-msg", "kimi-msg", "kimi-resp"]) {
+        assert_eq!(
+            s.header("authorization"),
+            Some(format!("Bearer token-{id}").as_str())
+        );
+        assert_eq!(
+            s.header("x-msh-device-id"),
+            Some(format!("device-{id}").as_str())
+        );
+        assert_eq!(s.header("x-msh-platform"), Some("Relay"));
+        assert_eq!(s.header("x-msh-version"), Some(relay_core::DISPLAY_VERSION));
+        // Claude-only OAuth capability flag is never added for Kimi.
+        assert!(s.header("anthropic-beta").is_none());
+        assert!(s.header("x-api-key").is_none());
+        assert_no_relay_headers(s);
+    }
+    // Endpoints Kimi isn't known to serve are refused before any send.
+    let r = send_owned(&c, &env, "/v1/responses/compact", &kimi[..1], FIRST_TURN).await;
+    assert_eq!(r.status, 404);
+    assert_eq!(up.count(), 3);
+    // Quota is "not reported", never borrowed from Anthropic header names.
+    let v = account_view(&env, "kimi-msg");
+    assert_eq!(v.vendor, Vendor::KimiCom);
+    assert!(v.windows.is_empty());
+    let snap = env.handle().snapshot();
+    assert!(snap.providers.iter().all(|p| p.vendor == Vendor::KimiCom));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vendors_are_isolated_for_default_pins_and_sessions() {
+    let kimi = Mock::start(Act::sse(vec![CLAUDE_SSE])).await;
+    let claude = Mock::start(Act::sse(vec![CLAUDE_SSE])).await;
+    // Kimi first: fill-first would pick it if vendors were not filtered.
+    let env = proxy(
+        vec![
+            vendor_account(
+                "kimi",
+                Provider::Anthropic,
+                Vendor::KimiCom,
+                AccountMode::Pooled,
+                &kimi.url(),
+            ),
+            account(
+                "claude",
+                Provider::Anthropic,
+                AccountMode::Pooled,
+                &claude.url(),
+            ),
+        ],
+        |_| {},
+    );
+    let c = client();
+    let s = ("x-claude-code-session-id", "shared-session");
+    let kv = ("x-relay-vendor", "kimi-com");
+    // No vendor header: first-party only, also for an existing client.
+    let r = send_owned(&c, &env, "/v1/messages", &[s], CLAUDE_BODY).await;
+    assert_eq!(r.status, 200);
+    assert_eq!((claude.count(), kimi.count()), (1, 0));
+    // Same session id on Kimi binds separately.
+    let r = send_owned(&c, &env, "/v1/messages", &[s, kv], CLAUDE_BODY).await;
+    assert_eq!(r.status, 200);
+    assert_eq!((claude.count(), kimi.count()), (1, 1));
+    let r = send_owned(&c, &env, "/v1/messages", &[s], CLAUDE_BODY).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        (claude.count(), kimi.count()),
+        (2, 1),
+        "session stays on its vendor"
+    );
+    // Cross-vendor pins are refused in both directions, even when the
+    // vendor is the first-party default.
+    let pin_kimi = ("x-relay-account", "kimi");
+    let pin_claude = ("x-relay-account", "claude");
+    for h in [vec![pin_kimi], vec![pin_claude, kv]] {
+        let r = send_owned(&c, &env, "/v1/messages", &h, CLAUDE_BODY).await;
+        assert_eq!(r.status, 403, "{h:?}");
+    }
+    // A pin that agrees with the vendor works.
+    let r = send_owned(&c, &env, "/v1/messages", &[pin_kimi, kv], CLAUDE_BODY).await;
+    assert_eq!(r.status, 200);
+    // Unknown vendors and wires a vendor doesn't speak are refused.
+    let r = send_owned(
+        &c,
+        &env,
+        "/v1/messages",
+        &[("x-relay-vendor", "kimi")],
+        CLAUDE_BODY,
+    )
+    .await;
+    assert_eq!(r.status, 400);
+    let r = send_owned(
+        &c,
+        &env,
+        "/v1/messages",
+        &[("x-relay-vendor", "xai")],
+        CLAUDE_BODY,
+    )
+    .await;
+    assert_eq!(r.status, 404);
+    assert_eq!((claude.count(), kimi.count()), (2, 2));
+    // Snapshot sections never combine vendors.
+    let v = account_view(&env, "claude");
+    assert_eq!(v.vendor, Vendor::Anthropic);
+    let snap = env.handle().snapshot();
+    let sections: Vec<_> = snap
+        .providers
+        .iter()
+        .map(|p| (p.provider, p.vendor))
+        .collect();
+    assert_eq!(
+        sections,
+        [
+            (Provider::Anthropic, Vendor::Anthropic),
+            (Provider::Anthropic, Vendor::KimiCom)
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_kimi_forwards_client_login_only_with_matching_vendor() {
+    let up = Mock::start(Act::sse(vec![CLAUDE_SSE])).await;
+    let mut a = vendor_account(
+        "kimi-cli",
+        Provider::Anthropic,
+        Vendor::KimiAi,
+        AccountMode::Observed,
+        &up.url(),
+    );
+    a.device_id = None;
+    let env = proxy(vec![a], |_| {});
+    let c = client();
+    let key = env.key.clone();
+    let base = [
+        ("authorization", "Bearer kimi-user-token"),
+        ("x-msh-device-id", "client-device"),
+        ("x-relay-key", key.as_str()),
+        ("x-relay-account", "kimi-cli"),
+    ];
+    let url = format!("{}/v1/messages", env.base());
+    let r = send(&c, url.clone(), &base, CLAUDE_BODY).await;
+    assert_eq!(r.status, 403, "pin without x-relay-vendor");
+    assert_eq!(up.count(), 0);
+    let mut h = base.to_vec();
+    h.push(("x-relay-vendor", "kimi-ai"));
+    let r = send(&c, url, &h, CLAUDE_BODY).await;
+    assert_eq!(r.status, 200);
+    let s = &up.seen()[0];
+    assert_eq!(s.header("authorization"), Some("Bearer kimi-user-token"));
+    assert_eq!(s.header("x-msh-device-id"), Some("client-device"));
+    assert_no_relay_headers(s);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xai_and_meta_get_bearer_only_and_never_fail_over_across_vendors() {
+    let xai =
+        Mock::start(Act::json(429, r#"{"error":"rate_limited"}"#).with_header("retry-after", "30"))
+            .await;
+    let meta = Mock::start(Act::sse(vec![CODEX_SSE])).await;
+    let openai = Mock::start(Act::sse(vec![CODEX_SSE])).await;
+    let env = proxy(
+        vec![
+            vendor_account(
+                "xai",
+                Provider::Openai,
+                Vendor::Xai,
+                AccountMode::Key,
+                &xai.url(),
+            ),
+            vendor_account(
+                "meta",
+                Provider::Openai,
+                Vendor::Meta,
+                AccountMode::Key,
+                &meta.url(),
+            ),
+            account("openai", Provider::Openai, AccountMode::Key, &openai.url()),
+        ],
+        |c| c.routing.default_pool = Pool::Key,
+    );
+    let c = client();
+    let r = send_owned(
+        &c,
+        &env,
+        "/v1/responses",
+        &[("x-relay-vendor", "xai")],
+        FIRST_TURN,
+    )
+    .await;
+    assert_ne!(
+        r.status, 200,
+        "xAI's rejection is not hidden by another vendor"
+    );
+    assert_eq!((xai.count(), meta.count(), openai.count()), (1, 0, 0));
+    let s = &xai.seen()[0];
+    assert_eq!(s.path, "/responses");
+    assert_eq!(s.header("authorization"), Some("Bearer token-xai"));
+    assert!(s.header("chatgpt-account-id").is_none());
+    assert!(
+        s.headers
+            .iter()
+            .all(|(k, _)| !k.starts_with("x-msh-") && !k.starts_with("x-grok"))
+    );
+    assert_no_relay_headers(s);
+    // The cooled-down xAI account isn't replaced by Meta or OpenAI.
+    let r = send_owned(
+        &c,
+        &env,
+        "/v1/responses",
+        &[("x-relay-vendor", "xai")],
+        FIRST_TURN,
+    )
+    .await;
+    assert_eq!(r.status, 503);
+    assert_eq!((meta.count(), openai.count()), (0, 0));
+
+    let r = send_owned(
+        &c,
+        &env,
+        "/v1/responses",
+        &[("x-relay-vendor", "meta")],
+        FIRST_TURN,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let s = &meta.seen()[0];
+    assert_eq!(s.header("authorization"), Some("Bearer token-meta"));
+    assert!(s.header("x-client-id").is_none());
+    assert_no_relay_headers(s);
+    // Meta has no compact route; refused before sending.
+    let r = send_owned(
+        &c,
+        &env,
+        "/v1/responses/compact",
+        &[("x-relay-vendor", "meta")],
+        FIRST_TURN,
+    )
+    .await;
+    assert_eq!(r.status, 404);
+    assert_eq!(meta.count(), 1);
+    // First-party default is untouched.
+    let r = send_owned(&c, &env, "/v1/responses", &[], FIRST_TURN).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(openai.count(), 1);
+    assert_eq!(
+        openai.seen()[0].header("authorization"),
+        Some("Bearer token-openai")
+    );
+    assert!(account_view(&env, "xai").windows.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xai_ambiguous_send_is_never_retried_on_another_account() {
+    let a = Mock::start(Act::Reset).await;
+    let b = Mock::start(Act::sse(vec![CODEX_SSE])).await;
+    let env = proxy(
+        vec![
+            vendor_account(
+                "xa",
+                Provider::Openai,
+                Vendor::Xai,
+                AccountMode::Pooled,
+                &a.url(),
+            ),
+            vendor_account(
+                "xb",
+                Provider::Openai,
+                Vendor::Xai,
+                AccountMode::Pooled,
+                &b.url(),
+            ),
+        ],
+        |_| {},
+    );
+    let c = client();
+    let r = send_owned(
+        &c,
+        &env,
+        "/v1/responses/compact",
+        &[("x-relay-vendor", "xai")],
+        FIRST_TURN,
+    )
+    .await;
+    assert_eq!(r.status, 502);
+    assert_eq!(r.headers["x-relay-error"], "upstream_ambiguous");
+    assert_eq!((a.count(), b.count()), (1, 0));
+    assert_eq!(a.seen()[0].path, "/responses/compact");
 }

@@ -143,6 +143,8 @@ fn main() {
         cfg.accounts.push(AccountConfig {
             id: AccountId("bench".into()),
             provider: Provider::Anthropic,
+            vendor: None,
+            device_id: None,
             label: "Bench".into(),
             mode: AccountMode::Observed,
             plan: None,

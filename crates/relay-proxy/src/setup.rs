@@ -54,13 +54,24 @@ pub fn client_setup(account: &AccountConfig, addr: SocketAddr) -> ClientSetup {
         Pool::Pooled => "pooled",
         Pool::Key => "key",
     };
-    let (entries, notes) = match (account.provider, pool) {
+    // Non-first-party vendors are selected explicitly; without the header a
+    // request routes to the wire's first-party vendor.
+    let vendor = account.vendor();
+    let (vline, vtoml) = if vendor.is_first_party() {
+        (String::new(), String::new())
+    } else {
+        (
+            format!("\nx-relay-vendor: {}", vendor.key()),
+            format!(",\"x-relay-vendor\"=\"{}\"", vendor.key()),
+        )
+    };
+    let (entries, mut notes) = match (account.provider, pool) {
         (Provider::Anthropic, None) => (
             vec![
                 entry("ANTHROPIC_BASE_URL", base, false),
                 entry(
                     "ANTHROPIC_CUSTOM_HEADERS",
-                    format!("x-relay-key: {KEY_PLACEHOLDER}\nx-relay-account: {id}"),
+                    format!("x-relay-key: {KEY_PLACEHOLDER}\nx-relay-account: {id}{vline}"),
                     true,
                 ),
             ],
@@ -74,7 +85,7 @@ pub fn client_setup(account: &AccountConfig, addr: SocketAddr) -> ClientSetup {
                 entry("ANTHROPIC_BASE_URL", base, false),
                 entry("ANTHROPIC_AUTH_TOKEN", KEY_PLACEHOLDER.into(), true),
                 entry("ANTHROPIC_API_KEY", String::new(), false),
-                entry("ANTHROPIC_CUSTOM_HEADERS", format!("x-relay-pool: {}", pool_key(p)), false),
+                entry("ANTHROPIC_CUSTOM_HEADERS", format!("x-relay-pool: {}{vline}", pool_key(p)), false),
             ],
             vec![
                 "Run /logout in this instance's config directory so the CLI sends Relay's key.".into(),
@@ -86,7 +97,7 @@ pub fn client_setup(account: &AccountConfig, addr: SocketAddr) -> ClientSetup {
                 entry(
                     "launchArgs",
                     format!(
-                        "-c model_provider=\"relay\" -c 'model_providers.relay={{name=\"Relay\",base_url=\"{base}/v1\",wire_api=\"responses\",requires_openai_auth=true,supports_websockets=false,http_headers={{\"x-relay-account\"=\"{id}\"}},env_http_headers={{\"x-relay-key\"=\"RELAY_KEY\"}}}}'"
+                        "-c model_provider=\"relay\" -c 'model_providers.relay={{name=\"Relay\",base_url=\"{base}/v1\",wire_api=\"responses\",requires_openai_auth=true,supports_websockets=false,http_headers={{\"x-relay-account\"=\"{id}\"{vtoml}}},env_http_headers={{\"x-relay-key\"=\"RELAY_KEY\"}}}}'"
                     ),
                     false,
                 ),
@@ -102,7 +113,7 @@ pub fn client_setup(account: &AccountConfig, addr: SocketAddr) -> ClientSetup {
                 entry(
                     "launchArgs",
                     format!(
-                        "-c model_provider=\"relay\" -c 'model_providers.relay={{name=\"Relay\",base_url=\"{base}/v1\",wire_api=\"responses\",env_key=\"RELAY_KEY\",requires_openai_auth=false,supports_websockets=false,http_headers={{\"x-relay-pool\"=\"{}\"}}}}'",
+                        "-c model_provider=\"relay\" -c 'model_providers.relay={{name=\"Relay\",base_url=\"{base}/v1\",wire_api=\"responses\",env_key=\"RELAY_KEY\",requires_openai_auth=false,supports_websockets=false,http_headers={{\"x-relay-pool\"=\"{}\"{vtoml}}}}}'",
                         pool_key(p)
                     ),
                     false,
@@ -112,6 +123,20 @@ pub fn client_setup(account: &AccountConfig, addr: SocketAddr) -> ClientSetup {
             vec!["Use setupMode \"existing\"; Relay picks the account.".into()],
         ),
     };
+    if !vendor.is_first_party() {
+        // Only first-party routes are proven; first-party notes would be
+        // wrong here.
+        notes = vec![
+            format!(
+                "Use {} model ids; Relay forwards the request without translation.",
+                vendor.label()
+            ),
+            format!(
+                "Relay's {} route is unverified with a live account.",
+                vendor.label()
+            ),
+        ];
+    }
     ClientSetup {
         provider: account.provider,
         mode: account.mode,
@@ -129,6 +154,8 @@ mod tests {
         AccountConfig {
             id: AccountId("work".into()),
             provider,
+            vendor: None,
+            device_id: None,
             label: "Work".into(),
             mode,
             plan: None,
@@ -165,5 +192,32 @@ mod tests {
         assert!(k.entries[0].value.contains("\"x-relay-pool\"=\"key\""));
         // The real key never appears.
         assert!(k.entries.iter().all(|e| !e.value.starts_with("relay-")));
+    }
+
+    #[test]
+    fn other_vendors_name_themselves_and_claim_nothing_verified() {
+        let addr = "127.0.0.1:9".parse().unwrap();
+        let mut a = acc(Provider::Anthropic, AccountMode::Pooled);
+        a.vendor = Some(relay_core::model::Vendor::KimiCom);
+        let s = client_setup(&a, addr);
+        let h = &s
+            .entries
+            .iter()
+            .find(|e| e.name == "ANTHROPIC_CUSTOM_HEADERS")
+            .unwrap()
+            .value;
+        assert_eq!(h, "x-relay-pool: pooled\nx-relay-vendor: kimi-com");
+        assert!(s.notes.iter().any(|n| n.contains("unverified")));
+        let mut x = acc(Provider::Openai, AccountMode::Observed);
+        x.vendor = Some(relay_core::model::Vendor::Xai);
+        let s = client_setup(&x, addr);
+        assert!(
+            s.entries[0]
+                .value
+                .contains(r#""x-relay-account"="work","x-relay-vendor"="xai""#)
+        );
+        // First-party output is unchanged.
+        let o = client_setup(&acc(Provider::Openai, AccountMode::Observed), addr);
+        assert!(!o.entries[0].value.contains("x-relay-vendor"));
     }
 }

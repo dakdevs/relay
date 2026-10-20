@@ -90,14 +90,7 @@ fn main() -> ExitCode {
                     }
                 },
             };
-            println!(
-                "account {} [{} · {}{}]: {}",
-                a.id,
-                a.provider.label(),
-                a.mode.label(),
-                if a.paused { " · paused" } else { "" },
-                status
-            );
+            println!("{}", account_line(a, &status));
         }
         return if ok {
             ExitCode::SUCCESS
@@ -144,4 +137,56 @@ fn main() -> ExitCode {
     eprintln!("relay-proxy: draining (up to 10 s)");
     handle.shutdown();
     ExitCode::SUCCESS
+}
+
+/// One `check` line. Names the vendor; for vendors that share another's
+/// wire, the wire too, so a Kimi account never reads as Anthropic.
+fn account_line(a: &relay_core::config::AccountConfig, status: &str) -> String {
+    let vendor = a.vendor();
+    let who = if vendor.is_first_party() {
+        vendor.label().to_string()
+    } else {
+        format!("{} · {} wire", vendor.label(), a.provider.label())
+    };
+    format!(
+        "account {} [{who} · {}{}]: {status}",
+        a.id,
+        a.mode.label(),
+        if a.paused { " · paused" } else { "" },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::account_line;
+    use relay_core::config::AccountConfig;
+    use relay_core::model::{AccountId, AccountMode, Provider, Vendor};
+
+    #[test]
+    fn check_lines_name_the_vendor_not_only_the_wire() {
+        let mut a = AccountConfig {
+            id: AccountId("k".into()),
+            provider: Provider::Anthropic,
+            vendor: None,
+            device_id: None,
+            label: "K".into(),
+            mode: AccountMode::Pooled,
+            plan: None,
+            identifier: None,
+            credential_kind: None,
+            upstream: None,
+            credential: None,
+            paused: false,
+            max_in_flight: 8,
+            models: vec![],
+        };
+        // First-party output is unchanged.
+        assert_eq!(account_line(&a, "ok"), "account k [Anthropic · Pooled]: ok");
+        a.vendor = Some(Vendor::KimiCom);
+        a.paused = true;
+        assert_eq!(
+            account_line(&a, "ok"),
+            "account k [Kimi · Anthropic wire · Pooled · paused]: ok"
+        );
+    }
 }

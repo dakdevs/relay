@@ -14,11 +14,11 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use relay_core::attempt::{
     Decision, MAX_ACCOUNTS_PER_REQUEST, Outcome, RETRY_BUDGET_MS, RequestTraits, decide,
 };
-use relay_core::model::{AccountId, AccountMode, Pool, Provider};
+use relay_core::model::{AccountId, AccountMode, Pool, Provider, Vendor};
 use relay_core::select::{Candidate, select};
 use relay_providers::auth::Credential;
 use relay_providers::headers::{
-    RELAY_ACCOUNT, RELAY_KEY, RELAY_POOL, downstream_response, upstream_request,
+    RELAY_ACCOUNT, RELAY_KEY, RELAY_POOL, RELAY_VENDOR, downstream_response, upstream_request,
 };
 use relay_providers::request::{Endpoint, RequestInfo, inspect, session_id};
 use relay_providers::tap::{Decisive, Tap, error_body};
@@ -173,6 +173,8 @@ struct Ctx {
     client: Client,
     endpoint: Endpoint,
     provider: Provider,
+    /// Vendor every account used for this request must belong to.
+    vendor: Vendor,
     method: Method,
     query: Option<String>,
     headers: HeaderMap,
@@ -255,6 +257,30 @@ pub async fn handle(sh: Arc<Shared>, client: Client, req: Request<Incoming>) -> 
         } else {
             Provider::Openai
         });
+    // The vendor is explicit or the wire's first party; never inferred from
+    // a pinned account, so a pin can't move a request to another vendor.
+    let vendor = match header_str(&parts.headers, RELAY_VENDOR) {
+        None => Vendor::first_party(provider),
+        Some(v) => match Vendor::from_key(v) {
+            Some(v) => v,
+            None => {
+                return json_error(
+                    Some(provider),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "x-relay-vendor names no known vendor",
+                );
+            }
+        },
+    };
+    if !endpoint.served_by(vendor, provider) {
+        return json_error(
+            Some(provider),
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "The selected vendor does not serve this endpoint through Relay",
+        );
+    }
 
     let limit = reg.config.server.max_body_bytes;
     let body = match Limited::new(body, limit).collect().await {
@@ -290,6 +316,7 @@ pub async fn handle(sh: Arc<Shared>, client: Client, req: Request<Incoming>) -> 
         client,
         endpoint,
         provider,
+        vendor,
         method: parts.method,
         query: parts.uri.query().map(str::to_string),
         headers: parts.headers,
@@ -318,11 +345,14 @@ async fn pass_through(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
             "x-relay-account names no configured account",
         );
     };
-    if acc.cfg.provider != ctx.provider || acc.cfg.mode != AccountMode::Observed {
+    if acc.cfg.provider != ctx.provider
+        || acc.cfg.vendor() != ctx.vendor
+        || acc.cfg.mode != AccountMode::Observed
+    {
         return ctx.err(
             StatusCode::FORBIDDEN,
             "permission_error",
-            "x-relay-account must name an observed account of this provider",
+            "x-relay-account must name an observed account of this provider and vendor (x-relay-vendor)",
         );
     }
     let mut attempt: u8 = 0;
@@ -405,7 +435,7 @@ async fn pick_recovering(
 ) -> Option<Arc<AccountRt>> {
     let due: Vec<_> = ctx
         .reg
-        .pool(ctx.provider, pool)
+        .pool(ctx.provider, ctx.vendor, pool)
         .filter(|a| !tried.contains(a.id()))
         .filter_map(|a| {
             a.claim_refresh(now)
@@ -432,7 +462,7 @@ fn pick(ctx: &Ctx, pool: Pool, tried: &[AccountId], now: i64) -> Option<Arc<Acco
     let model = ctx.info.model.as_deref();
     let accounts: Vec<&Arc<AccountRt>> = ctx
         .reg
-        .pool(ctx.provider, pool)
+        .pool(ctx.provider, ctx.vendor, pool)
         .filter(|a| !tried.contains(a.id()))
         .collect();
     let routing = &ctx.reg.config.routing;
@@ -478,14 +508,18 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
     let ttl = Duration::from_secs(u64::from(routing.session_ttl_minutes) * 60);
     let pinned = match named {
         Some(n) => match ctx.reg.account(n) {
-            Some(a) if a.cfg.provider == ctx.provider && a.cfg.mode == pool.mode() => {
+            Some(a)
+                if a.cfg.provider == ctx.provider
+                    && a.cfg.vendor() == ctx.vendor
+                    && a.cfg.mode == pool.mode() =>
+            {
                 Some(a.clone())
             }
             _ => {
                 return ctx.err(
                     StatusCode::FORBIDDEN,
                     "permission_error",
-                    "x-relay-account must name an account in the selected pool",
+                    "x-relay-account must name an account in the selected pool and vendor (x-relay-vendor)",
                 );
             }
         },
@@ -516,9 +550,13 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
             let bound = session
                 .as_deref()
                 .filter(|_| tried.is_empty())
-                .and_then(|s| ctx.sh.sessions.get(ctx.provider, s, ttl))
+                .and_then(|s| ctx.sh.sessions.get(ctx.provider, ctx.vendor, s, ttl))
                 .and_then(|id| ctx.reg.account(id.as_str()).cloned())
-                .filter(|a| a.cfg.mode == pool.mode() && a.cfg.provider == ctx.provider);
+                .filter(|a| {
+                    a.cfg.mode == pool.mode()
+                        && a.cfg.provider == ctx.provider
+                        && a.cfg.vendor() == ctx.vendor
+                });
             match bound {
                 Some(b) if b.candidate(ctx.info.model.as_deref(), now, false).eligible => b,
                 // The bound account can't serve, and the request may move.
@@ -581,7 +619,7 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
         match attempt_once(ctx, &acc, attempt, true, may_auth_retry, Some(permit)).await {
             Attempt::Commit(r) => {
                 if let Some(s) = &session {
-                    ctx.sh.sessions.bind(ctx.provider, s, acc.id());
+                    ctx.sh.sessions.bind(ctx.provider, ctx.vendor, s, acc.id());
                     ctx.sh.changed();
                 }
                 return r;
@@ -611,7 +649,7 @@ async fn owned(ctx: &Ctx, named: Option<&str>) -> Response<RespBody> {
         let mut r = ctx.err(StatusCode::SERVICE_UNAVAILABLE, "no_eligible_account", "No account in this pool can take the request now (paused, cooling down, exhausted, disconnected or not allowed for this model). Relay never falls back to another pool.");
         let soonest = ctx
             .reg
-            .pool(ctx.provider, pool)
+            .pool(ctx.provider, ctx.vendor, pool)
             .map(|a| a.cooldown_until.load(Ordering::Relaxed))
             .filter(|c| *c > now_ms())
             .min();
@@ -696,9 +734,16 @@ async fn attempt_once(
         None
     };
     if owned {
-        let injected = sent_credential
-            .as_deref()
-            .map(|c| auth::inject(acc.cfg.provider, acc.cfg.credential_kind(), &mut headers, c));
+        let injected = sent_credential.as_deref().map(|c| {
+            auth::inject_for(
+                acc.cfg.vendor(),
+                acc.cfg.provider,
+                acc.cfg.credential_kind(),
+                acc.cfg.device_id.as_deref(),
+                &mut headers,
+                c,
+            )
+        });
         if !matches!(injected, Some(Ok(()))) {
             let response = ctx.err(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -762,7 +807,7 @@ async fn attempt_once(
         }
     };
     let now = now_ms();
-    let update = quota::parse(acc.cfg.provider, resp.headers(), now);
+    let update = quota::parse_for(acc.cfg.vendor(), acc.cfg.provider, resp.headers(), now);
     if acc.observe(&update, now) {
         ctx.sh.changed();
     }
